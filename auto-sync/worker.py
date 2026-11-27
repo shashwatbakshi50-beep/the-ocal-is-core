@@ -61,6 +61,16 @@ H3_RESOLUTION = _env_int("H3_RESOLUTION", 9)
 SYNC_BBOX = os.environ.get("SYNC_BBOX", "").strip()
 OVERPASS_URL = _env("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
 OVERPASS_TIMEOUT = _env_int("OVERPASS_TIMEOUT", 180)
+OVERPASS_RETRIES = _env_int("OVERPASS_RETRIES", 2)
+OVERPASS_FALLBACK_URLS = [
+    url.strip()
+    for url in os.environ.get(
+        "OVERPASS_FALLBACK_URLS",
+        "https://overpass.kumi.systems/api/interpreter,"
+        "https://overpass.private.coffee/api/interpreter",
+    ).split(",")
+    if url.strip()
+]
 OVERTURE_ENABLED = _env("OVERTURE_ENABLED", "1").lower() not in ("0", "false", "no")
 OVERTURE_RELEASE = os.environ.get("OVERTURE_RELEASE", "").strip()
 OVERTURE_S3_BUCKET = _env("OVERTURE_S3_BUCKET", "overturemaps-us-west-2")
@@ -552,20 +562,24 @@ def fetch_overpass(bbox: BoundingBox) -> dict[str, Any]:
         east=bbox.max_lon,
     )
     last_error: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            with httpx.Client(
-                timeout=OVERPASS_TIMEOUT + 30, headers={"User-Agent": HTTP_USER_AGENT}
-            ) as client:
-                response = client.post(OVERPASS_URL, data={"data": query})
-                if response.status_code in (429, 504):
-                    raise RuntimeError(f"overpass busy ({response.status_code})")
-                response.raise_for_status()
-                return response.json()
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            log.warning("overpass attempt %s failed: %s", attempt, exc)
-            time.sleep(5 * attempt)
+    # The public Overpass instances are frequently overloaded, so every endpoint
+    # in the list is tried before the sync is reported as failed.
+    for url in [OVERPASS_URL, *OVERPASS_FALLBACK_URLS]:
+        for attempt in range(1, OVERPASS_RETRIES + 1):
+            try:
+                with httpx.Client(
+                    timeout=OVERPASS_TIMEOUT + 30,
+                    headers={"User-Agent": HTTP_USER_AGENT},
+                ) as client:
+                    response = client.post(url, data={"data": query})
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        raise RuntimeError(f"overpass busy ({response.status_code})")
+                    response.raise_for_status()
+                    return response.json()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                log.warning("overpass %s attempt %s failed: %s", url, attempt, exc)
+                time.sleep(3 * attempt)
     raise RuntimeError(f"overpass request failed: {last_error}")
 
 

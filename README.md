@@ -132,6 +132,8 @@ All settings are environment variables (see `.env.example`). The important ones:
 | `SYNC_BBOX` | `5.20,52.00,5.23,52.02` | `min_lon,min_lat,max_lon,max_lat` to ingest |
 | `H3_RESOLUTION` | `9` | H3 resolution for indexing |
 | `OVERPASS_URL` / `OVERPASS_TIMEOUT` | public endpoint / `180` | Overpass endpoint and per-request timeout |
+| `OVERPASS_RETRIES` | `2` | attempts per Overpass endpoint before moving on |
+| `OVERPASS_FALLBACK_URLS` | two public mirrors | endpoints tried when the main one is overloaded |
 | `OVERTURE_ENABLED` | `1` | read Overture parquet |
 | `OVERTURE_RELEASE` | latest STAC release | pin an Overture release |
 | `OVERTURE_LIMIT` | `50000` | max rows read per Overture theme per sync |

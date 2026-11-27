@@ -16,10 +16,12 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shutil
 import subprocess
 import threading
 import time
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -61,7 +63,14 @@ H3_RESOLUTION = _env_int("H3_RESOLUTION", 9)
 SYNC_BBOX = os.environ.get("SYNC_BBOX", "").strip()
 OVERPASS_URL = _env("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
 OVERPASS_TIMEOUT = _env_int("OVERPASS_TIMEOUT", 180)
-OVERPASS_RETRIES = _env_int("OVERPASS_RETRIES", 2)
+OVERPASS_RETRIES = _env_int("OVERPASS_RETRIES", 4)
+OVERPASS_BACKOFF = float(os.environ.get("OVERPASS_BACKOFF", "10") or 10)
+OVERPASS_BUDGET = float(os.environ.get("OVERPASS_BUDGET", "180") or 180)
+OVERPASS_CONNECT_TIMEOUT = float(os.environ.get("OVERPASS_CONNECT_TIMEOUT", "20") or 20)
+OSM_API_RETRIES = _env_int("OSM_API_RETRIES", 3)
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+OSM_API_URL = _env("OSM_API_URL", "https://api.openstreetmap.org")
+OSM_API_FALLBACK = _env("OSM_API_FALLBACK", "1").lower() not in ("0", "false", "no")
 OVERPASS_FALLBACK_URLS = [
     url.strip()
     for url in os.environ.get(
@@ -553,6 +562,100 @@ out body geom meta;
 """
 
 
+def _retry_delay(response: httpx.Response | None, attempt: int, base: float) -> float:
+    """Honour Retry-After, otherwise exponential backoff with jitter."""
+    if response is not None:
+        header = response.headers.get("retry-after", "").strip()
+        if header.isdigit():
+            return min(float(header), 300.0)
+    return min(base * (2 ** (attempt - 1)), 120.0) + random.uniform(0, 1)
+
+
+def fetch_osm_api(bbox: BoundingBox) -> dict[str, Any]:
+    """Fallback for when every Overpass instance is at capacity.
+
+    The OSM API returns the same raw elements, just as XML and limited to a
+    small bbox (0.25 deg², 50k nodes), which is exactly the village-sized area
+    this service syncs.
+    """
+    url = f"{OSM_API_URL.rstrip('/')}/api/0.6/map"
+    params = {"bbox": f"{bbox.min_lon},{bbox.min_lat},{bbox.max_lon},{bbox.max_lat}"}
+    for attempt in range(1, OSM_API_RETRIES + 1):
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(
+                    connect=OVERPASS_CONNECT_TIMEOUT,
+                    read=OVERPASS_TIMEOUT,
+                    write=60.0,
+                    pool=OVERPASS_CONNECT_TIMEOUT,
+                ),
+                headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/xml"},
+            ) as client:
+                response = client.get(url, params=params)
+                if response.status_code == 400:
+                    raise RuntimeError(f"osm api rejected the bbox: {response.text[:200]}")
+                response.raise_for_status()
+                root = ET.fromstring(response.content)
+            break
+        except Exception as exc:  # noqa: BLE001
+            log.warning("osm api attempt %s/%s failed: %s", attempt, OSM_API_RETRIES, exc)
+            if attempt == OSM_API_RETRIES:
+                raise
+            time.sleep(5 * attempt)
+
+    def tags_of(element: ET.Element) -> dict[str, str]:
+        return {tag.get("k"): tag.get("v") for tag in element.findall("tag")}
+
+    def meta_of(element: ET.Element) -> dict[str, Any]:
+        return {
+            "user": element.get("user"),
+            "version": int(element.get("version") or 0) or None,
+            "timestamp": element.get("timestamp"),
+            "changeset": int(element.get("changeset") or 0) or None,
+        }
+
+    coordinates: dict[str, tuple[float, float]] = {}
+    nodes: list[dict[str, Any]] = []
+    for node in root.findall("node"):
+        node_id = node.get("id")
+        lat, lon = float(node.get("lat")), float(node.get("lon"))
+        coordinates[node_id] = (lat, lon)
+        nodes.append(
+            {
+                "type": "node",
+                "id": int(node_id),
+                "lat": lat,
+                "lon": lon,
+                "tags": tags_of(node),
+                **meta_of(node),
+            }
+        )
+
+    ways: list[dict[str, Any]] = []
+    for way in root.findall("way"):
+        geometry = []
+        for nd in way.findall("nd"):
+            point = coordinates.get(nd.get("ref"))
+            if point is None:
+                geometry = []
+                break
+            geometry.append({"lat": point[0], "lon": point[1]})
+        if not geometry:
+            continue
+        ways.append(
+            {
+                "type": "way",
+                "id": int(way.get("id")),
+                "tags": tags_of(way),
+                "geometry": geometry,
+                **meta_of(way),
+            }
+        )
+
+    log.info("osm api: %s nodes, %s ways", len(nodes), len(ways))
+    return {"elements": ways + nodes}
+
+
 def fetch_overpass(bbox: BoundingBox) -> dict[str, Any]:
     query = OVERPASS_QUERY.format(
         timeout=OVERPASS_TIMEOUT,
@@ -562,24 +665,49 @@ def fetch_overpass(bbox: BoundingBox) -> dict[str, Any]:
         east=bbox.max_lon,
     )
     last_error: Exception | None = None
-    # The public Overpass instances are frequently overloaded, so every endpoint
-    # in the list is tried before the sync is reported as failed.
+    # The public Overpass instances are frequently at capacity and answer
+    # 429/502/504. Every endpoint is retried with backoff, but the whole phase
+    # is capped by OVERPASS_BUDGET so the OSM API fallback runs soon after.
+    deadline = time.monotonic() + OVERPASS_BUDGET
     for url in [OVERPASS_URL, *OVERPASS_FALLBACK_URLS]:
         for attempt in range(1, OVERPASS_RETRIES + 1):
+            remaining = deadline - time.monotonic()
+            if remaining < 15:
+                raise RuntimeError(
+                    f"overpass request failed: {last_error} (budget exhausted)"
+                )
+            response: httpx.Response | None = None
             try:
                 with httpx.Client(
-                    timeout=OVERPASS_TIMEOUT + 30,
-                    headers={"User-Agent": HTTP_USER_AGENT},
+                    timeout=httpx.Timeout(
+                        connect=OVERPASS_CONNECT_TIMEOUT,
+                        read=max(20.0, min(OVERPASS_TIMEOUT + 30, remaining)),
+                        write=60.0,
+                        pool=OVERPASS_CONNECT_TIMEOUT,
+                    ),
+                    headers={
+                        "User-Agent": HTTP_USER_AGENT,
+                        "Accept": "application/json",
+                    },
                 ) as client:
                     response = client.post(url, data={"data": query})
-                    if response.status_code in (429, 500, 502, 503, 504):
+                    if response.status_code in RETRYABLE_STATUS:
                         raise RuntimeError(f"overpass busy ({response.status_code})")
                     response.raise_for_status()
                     return response.json()
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                log.warning("overpass %s attempt %s failed: %s", url, attempt, exc)
-                time.sleep(3 * attempt)
+                delay = _retry_delay(response, attempt, OVERPASS_BACKOFF)
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+                log.warning(
+                    "overpass %s attempt %s/%s failed: %s (retrying in %.1fs)",
+                    url,
+                    attempt,
+                    OVERPASS_RETRIES,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
     raise RuntimeError(f"overpass request failed: {last_error}")
 
 
@@ -858,7 +986,13 @@ def run_sync(
         if bbox is None:
             raise ValueError("no bbox supplied; pass one in the request or set SYNC_BBOX")
         if source in ("osm", "all"):
-            payload = fetch_overpass(bbox)
+            try:
+                payload = fetch_overpass(bbox)
+            except Exception as exc:  # noqa: BLE001 - mirrors may all be busy
+                if not OSM_API_FALLBACK:
+                    raise
+                log.warning("overpass unavailable (%s); falling back to the OSM API", exc)
+                payload = fetch_osm_api(bbox)
             with db.pool.connection() as conn:
                 partial = upsert_features(conn, overpass_features(payload), resolution)
             stats.add(partial)

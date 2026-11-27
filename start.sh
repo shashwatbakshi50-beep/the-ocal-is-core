@@ -20,6 +20,11 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required for the health check and the first sync" >&2
+    exit 1
+fi
+
 DOCKER=(docker)
 if ! docker info >/dev/null 2>&1; then
     if sudo -n docker info >/dev/null 2>&1; then
@@ -107,6 +112,6 @@ Useful calls:
        -H 'content-type: application/json' \\
        -d '{"bbox":{"min_lon":5.20,"min_lat":52.00,"max_lon":5.23,"max_lat":52.02},"name":"village"}'
 
-Logs:  docker compose logs -f auto-sync
-Stop:  docker compose down
+Logs:  ${DC[*]} logs -f auto-sync
+Stop:  ${DC[*]} down
 EOF

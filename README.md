@@ -58,8 +58,9 @@ Optional profiles:
 FastAPI worker that turns OpenStreetMap and Overture Maps data into a versioned,
 H3-indexed road history in PostGIS.
 
-* **Sources** – Overpass API (`highway=*`, `building=*`, `ele` nodes) and Overture
-  Maps `transportation/segment` + `buildings/building` parquet, read with DuckDB
+* **Sources** – Overpass API (`highway=*`, `building=*`, `ele` nodes) with mirror
+  retries and an OSM API fallback for small bboxes, plus Overture Maps
+  `transportation/segment` + `buildings/building` parquet read with DuckDB
   straight from the public S3 bucket.
 * **H3** – every geometry is indexed at resolution 9 (configurable). The primary
   cell drives lookups; all intersecting cells are stored in `h3_cells` for
@@ -132,8 +133,14 @@ All settings are environment variables (see `.env.example`). The important ones:
 | `SYNC_BBOX` | `5.20,52.00,5.23,52.02` | `min_lon,min_lat,max_lon,max_lat` to ingest |
 | `H3_RESOLUTION` | `9` | H3 resolution for indexing |
 | `OVERPASS_URL` / `OVERPASS_TIMEOUT` | public endpoint / `180` | Overpass endpoint and per-request timeout |
-| `OVERPASS_RETRIES` | `2` | attempts per Overpass endpoint before moving on |
+| `OVERPASS_RETRIES` | `4` | attempts per Overpass endpoint before moving on |
+| `OVERPASS_BACKOFF` | `10` | base seconds for the exponential backoff (honours `Retry-After`) |
+| `OVERPASS_BUDGET` | `180` | seconds spent on Overpass before the OSM API fallback |
+| `OVERPASS_CONNECT_TIMEOUT` | `20` | connect/TLS timeout, so a stalled endpoint fails fast |
 | `OVERPASS_FALLBACK_URLS` | two public mirrors | endpoints tried when the main one is overloaded |
+| `OSM_API_FALLBACK` | `1` | read the bbox from the OSM API when every Overpass instance is busy |
+| `OSM_API_URL` | `https://api.openstreetmap.org` | OSM API base URL for that fallback |
+| `OSM_API_RETRIES` | `3` | attempts against the OSM API |
 | `OVERTURE_ENABLED` | `1` | read Overture parquet |
 | `OVERTURE_RELEASE` | latest STAC release | pin an Overture release |
 | `OVERTURE_LIMIT` | `50000` | max rows read per Overture theme per sync |

@@ -1,0 +1,252 @@
+# Master compose file for the ocal maps stack.
+#
+# Core (always started):
+#   postgres    PostGIS 16-3.4 database that holds the road history
+#   auto-sync   OSM/Overture ingestion, live H3 closures, PMTiles generation
+#   libheadway  offline tileserver + PMTiles extractor built from libheadway-main
+#
+# Profiles (start explicitly, so a small VPS never OOMs):
+#   maps      headway-main frontend, Valhalla, tileserver, travelmux
+#   billing   lago-main API, worker, frontend, Postgres and Redis
+#   ai        ollama-main
+#
+# Usage:
+#   docker compose up -d postgres auto-sync libheadway
+#   docker compose --profile maps up -d
+#   docker compose --profile billing up -d
+
+name: the-ocal-is-core
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ocal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ocal}
+      POSTGRES_DB: ${POSTGRES_DB:-ocal}
+    volumes:
+      - "postgres_data:/var/lib/postgresql/data"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ocal} -d ${POSTGRES_DB:-ocal}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [ocal-core]
+    <<: *logging
+
+  auto-sync:
+    build:
+      context: ./auto-sync
+      # `with-cli` copies headway-cli out of the libheadway image, which is what
+      # /api/pmtiles/extract shells out to. Build it with:
+      #   docker compose build auto-sync
+      target: with-cli
+      additional_contexts:
+        headway: "service:libheadway"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      libheadway:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ocal}:${POSTGRES_PASSWORD:-ocal}@postgres:5432/${POSTGRES_DB:-ocal}
+      SYNC_BBOX: ${SYNC_BBOX:-5.20,52.00,5.23,52.02}
+      H3_RESOLUTION: ${H3_RESOLUTION:-9}
+      OVERPASS_URL: ${OVERPASS_URL:-https://overpass-api.de/api/interpreter}
+      OVERPASS_TIMEOUT: ${OVERPASS_TIMEOUT:-180}
+      OVERTURE_ENABLED: ${OVERTURE_ENABLED:-1}
+      OVERTURE_RELEASE: ${OVERTURE_RELEASE:-}
+      ELEVATION_PROVIDER: ${ELEVATION_PROVIDER:-none}
+      LIBHEADWAY_CLI: /usr/local/bin/headway-cli
+      LIBHEADWAY_STORAGE_DIR: /data/libheadway
+      PMTILES_DIR: /data/pmtiles
+      PMTILES_SOURCE_URL: ${PMTILES_SOURCE_URL:-}
+      VALHALLA_URL: ${VALHALLA_URL:-http://valhalla:8002}
+      VALHALLA_COSTING_PROFILES: /config/costing_profiles.json
+      VALHALLA_DEFAULT_PROFILE: ${VALHALLA_DEFAULT_PROFILE:-village_car}
+    volumes:
+      - "./data/auto-sync:/data"
+      - "./headway-main/valhalla:/config:ro"
+    ports:
+      - "127.0.0.1:${AUTO_SYNC_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [ocal-core]
+    <<: *logging
+
+  libheadway:
+    build:
+      context: ./libheadway-main/libheadway-main
+    restart: unless-stopped
+    environment:
+      HEADWAY_STORAGE_DIR: /data
+      HEADWAY_EXTRACT_SOURCE_URL: ${HEADWAY_EXTRACT_SOURCE_URL:-}
+      HEADWAY_BIND: 0.0.0.0:9123
+    volumes:
+      - "libheadway_data:/data"
+    ports:
+      - "127.0.0.1:${LIBHEADWAY_PORT:-9123}:9123"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9123/status"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [ocal-core]
+    <<: *logging
+
+  # ---------------------------------------------------------------- maps profile
+  valhalla:
+    image: ghcr.io/headwaymaps/valhalla:latest
+    profiles: [maps]
+    restart: unless-stopped
+    volumes:
+      - "valhalla_data:/data"
+      - "./headway-main/valhalla/valhalla.json:/config/valhalla.json:ro"
+      - "./headway-main/valhalla/costing_profiles.json:/config/costing_profiles.json:ro"
+    command: ["valhalla_service", "/config/valhalla.json", "1"]
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    networks: [ocal-core]
+    <<: *logging
+
+  tileserver:
+    image: ghcr.io/headwaymaps/tileserver:latest
+    profiles: [maps]
+    restart: unless-stopped
+    environment:
+      PORT: 8000
+    volumes:
+      - "tileserver_data:/data:ro"
+    networks: [ocal-core]
+    <<: *logging
+
+  travelmux:
+    image: ghcr.io/headwaymaps/travelmux:latest
+    profiles: [maps]
+    restart: unless-stopped
+    command: ["--valhalla=valhalla=http://valhalla:8002"]
+    networks: [ocal-core]
+    <<: *logging
+
+  headway:
+    image: ghcr.io/headwaymaps/headway:latest
+    profiles: [maps]
+    restart: unless-stopped
+    environment:
+      HEADWAY_RESOLVER: 127.0.0.11
+      HEADWAY_VALHALLA_URL: http://valhalla:8002
+      HEADWAY_TILESERVER_URL: http://tileserver:8000
+      HEADWAY_TRAVELMUX_URL: http://travelmux:8000
+    volumes:
+      - "frontend_data:/data:ro"
+    ports:
+      - "127.0.0.1:${HEADWAY_PORT:-8080}:8080"
+    depends_on: [valhalla, tileserver, travelmux]
+    networks: [ocal-core]
+    <<: *logging
+
+  # ------------------------------------------------------------- billing profile
+  lago-db:
+    image: getlago/postgres-partman:15.0-alpine
+    profiles: [billing]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${LAGO_POSTGRES_USER:-lago}
+      POSTGRES_PASSWORD: ${LAGO_POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${LAGO_POSTGRES_DB:-lago}
+    volumes:
+      - "lago_postgres_data:/var/lib/postgresql/data"
+    networks: [ocal-core]
+
+  lago-redis:
+    image: redis:7-alpine
+    profiles: [billing]
+    restart: unless-stopped
+    volumes:
+      - "lago_redis_data:/data"
+    networks: [ocal-core]
+
+  lago-api:
+    image: getlago/api:v1.57.0
+    profiles: [billing]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${LAGO_POSTGRES_USER:-lago}:${LAGO_POSTGRES_PASSWORD:-changeme}@lago-db:5432/${LAGO_POSTGRES_DB:-lago}?search_path=public
+      REDIS_URL: redis://lago-redis:6379
+      SECRET_KEY_BASE: ${LAGO_SECRET_KEY_BASE:-please-change-me}
+      LAGO_RSA_PRIVATE_KEY: ${LAGO_RSA_PRIVATE_KEY:-}
+      LAGO_API_URL: ${LAGO_API_URL:-http://localhost:3000}
+      LAGO_FRONT_URL: ${LAGO_FRONT_URL:-http://localhost}
+    ports:
+      - "127.0.0.1:${LAGO_API_PORT:-3000}:3000"
+    depends_on: [lago-db, lago-redis]
+    networks: [ocal-core]
+
+  lago-worker:
+    image: getlago/api:v1.57.0
+    profiles: [billing]
+    restart: unless-stopped
+    command: ["bundle", "exec", "sidekiq"]
+    environment:
+      DATABASE_URL: postgresql://${LAGO_POSTGRES_USER:-lago}:${LAGO_POSTGRES_PASSWORD:-changeme}@lago-db:5432/${LAGO_POSTGRES_DB:-lago}?search_path=public
+      REDIS_URL: redis://lago-redis:6379
+      SECRET_KEY_BASE: ${LAGO_SECRET_KEY_BASE:-please-change-me}
+      LAGO_RSA_PRIVATE_KEY: ${LAGO_RSA_PRIVATE_KEY:-}
+    depends_on: [lago-db, lago-redis]
+    networks: [ocal-core]
+
+  lago-front:
+    image: getlago/front:v1.57.0
+    profiles: [billing]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LAGO_FRONT_PORT:-3001}:80"
+    depends_on: [lago-api]
+    networks: [ocal-core]
+
+  # ------------------------------------------------------------------ ai profile
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [ai]
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-5m}
+    volumes:
+      - "ollama_data:/root/.ollama"
+    ports:
+      - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
+    deploy:
+      resources:
+        limits:
+          memory: ${OLLAMA_MEMORY_LIMIT:-8g}
+    networks: [ocal-core]
+
+volumes:
+  postgres_data:
+  libheadway_data:
+  valhalla_data:
+  tileserver_data:
+  frontend_data:
+  lago_postgres_data:
+  lago_redis_data:
+  ollama_data:
+
+networks:
+  ocal-core:
+    driver: bridge

@@ -55,6 +55,12 @@ services:
       - valhalla_backend
     volumes:
       - "valhalla_data:/data/:ro"
+      - "./valhalla/valhalla.json:/config/valhalla.json:ro"
+      - "./valhalla/costing_profiles.json:/config/costing_profiles.json:ro"
+    # Narrow village streets, rural tracks, flyover guidance, vehicle size limits
+    # and live H3 road blocks are configured in valhalla/valhalla.json and
+    # valhalla/costing_profiles.json.
+    command: ["valhalla_service", "/config/valhalla.json", "1"]
     ulimits:
       nofile:
         soft: 8192

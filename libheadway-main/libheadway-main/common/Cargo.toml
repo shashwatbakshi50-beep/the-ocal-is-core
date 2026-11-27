@@ -1,5 +1,5 @@
 [workspace]
-members = ["headway", "uniffi-bindgen", "uniffi-bindgen-swift"]
+members = ["headway", "headway-cli", "uniffi-bindgen", "uniffi-bindgen-swift"]
 resolver = "2"
 
 [workspace.package]

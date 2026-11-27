@@ -1,0 +1,23 @@
+#!/bin/bash
+# Stop, remove volumes, and restart docker compose services
+
+set -e
+
+CONFIG_DIR="$1"
+if [ -z "$CONFIG_DIR" ]; then
+    cat <<EOS
+Usage: $0 <build-config-dir>
+
+Example:
+    $0 builds/Bogota
+Override the compose file:
+    COMPOSE_FILE=docker-compose.yaml $0 builds/Seattle
+Otherwise the compose file follows whether the build has any transit zones.
+EOS
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+"$SCRIPT_DIR/stop-and-remove-services" "$CONFIG_DIR"
+"$SCRIPT_DIR/start-services" "$CONFIG_DIR"

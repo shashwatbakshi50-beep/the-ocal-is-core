@@ -1,0 +1,466 @@
+/*
+ * Copyright 2017-2018 Uber Technologies, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "algos.h"
+#include "test.h"
+#include "utility.h"
+
+/*
+Search a `LinkedGeoPolygon` and return first polygon whose
+outer loop has exactly `n` coords.
+
+Used for order-independent testing of `LinkedGeoPolygon` output.
+Returns the first match, so results are ambiguous if multiple polygons
+share the size outer loop.
+*/
+static LinkedGeoPolygon *findLinkedPolygonByOuterCount(LinkedGeoPolygon *root,
+                                                       int n) {
+    LinkedGeoPolygon *poly = root;
+    while (poly) {
+        if (poly->first && countLinkedCoords(poly->first) == n) return poly;
+        poly = poly->next;
+    }
+    return NULL;
+}
+
+/*
+Assert that the children of `parent` at `childRes` are outlined by a
+single polygon with a single loop (no holes).
+*/
+static void assertChildrenSinglePolygon(H3Index parent, int childRes) {
+    int64_t numCells;
+    t_assertSuccess(H3_EXPORT(cellToChildrenSize)(parent, childRes, &numCells));
+    H3Index *cells = calloc(numCells, sizeof(H3Index));
+    t_assertSuccess(H3_EXPORT(cellToChildren)(parent, childRes, cells));
+
+    LinkedGeoPolygon polygon;
+    t_assertSuccess(
+        H3_EXPORT(cellsToLinkedMultiPolygon)(cells, (int)numCells, &polygon));
+    t_assert(countLinkedPolygons(&polygon) == 1, "1 polygon added");
+    t_assert(countLinkedLoops(&polygon) == 1, "1 loop on the first polygon");
+
+    H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    free(cells);
+}
+
+static void children_assertions(H3Index h) {
+    assertChildrenSinglePolygon(h, H3_EXPORT(getResolution)(h) + 1);
+}
+
+static void grandchildren_assertions(H3Index h) {
+    assertChildrenSinglePolygon(h, H3_EXPORT(getResolution)(h) + 2);
+}
+
+SUITE(cellsToLinkedMultiPolygon) {
+    TEST(empty) {
+        LinkedGeoPolygon polygon;
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(NULL, 0, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 0, "No loops added to polygon");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(singleHex) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x890dab6220bffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 1, "1 loop added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == 6,
+                 "6 coords added to loop");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(invalid) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0xfffffffffffffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assert(H3_EXPORT(cellsToLinkedMultiPolygon)(
+                     set, numHexes, &polygon) == E_CELL_INVALID,
+                 "Invalid set fails");
+    }
+
+    TEST(contiguous2) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x8928308291bffff, 0x89283082957ffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 1, "1 loop added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == 10,
+                 "All coords added to loop except 2 shared");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    // TODO: This test asserts incorrect behavior - we should be creating
+    // multiple polygons, each with their own single loop. Update when the
+    // algorithm is corrected.
+    TEST(nonContiguous2) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x8928308291bffff, 0x89283082943ffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedPolygons(&polygon) == 2, "2 polygons added");
+        t_assert(countLinkedLoops(&polygon) == 1,
+                 "1 loop on the first polygon");
+        t_assert(countLinkedCoords(polygon.first) == 6,
+                 "All coords for one hex added to first loop");
+        t_assert(countLinkedLoops(polygon.next) == 1,
+                 "Loop count on second polygon correct");
+        t_assert(countLinkedCoords(polygon.next->first) == 6,
+                 "All coords for one hex added to second polygon");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(contiguous3) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x8928308288bffff, 0x892830828d7ffff,
+                         0x8928308289bffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 1, "1 loop added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == 12,
+                 "All coords added to loop except 6 shared");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(hole) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x892830828c7ffff, 0x892830828d7ffff,
+                         0x8928308289bffff, 0x89283082813ffff,
+                         0x8928308288fffff, 0x89283082883ffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon);
+
+        t_assert(countLinkedLoops(&polygon) == 2, "2 loops added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == 6 * 3,
+                 "All outer coords added to first loop");
+        t_assert(countLinkedCoords(polygon.first->next) == 6,
+                 "All inner coords added to second loop");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(pentagon) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x851c0003fffffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 1, "1 loop added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == 10,
+                 "10 coords (distorted pentagon) added to loop");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(twoRing) {
+        LinkedGeoPolygon polygon;
+        // 2-ring, in order returned by k-ring algo
+        H3Index set[] = {
+            0x8930062838bffff, 0x8930062838fffff, 0x89300628383ffff,
+            0x8930062839bffff, 0x893006283d7ffff, 0x893006283c7ffff,
+            0x89300628313ffff, 0x89300628317ffff, 0x893006283bbffff,
+            0x89300628387ffff, 0x89300628397ffff, 0x89300628393ffff,
+            0x89300628067ffff, 0x8930062806fffff, 0x893006283d3ffff,
+            0x893006283c3ffff, 0x893006283cfffff, 0x8930062831bffff,
+            0x89300628303ffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 1, "1 loop added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == (6 * (2 * 2 + 1)),
+                 "Expected number of coords added to loop");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(twoRingUnordered) {
+        LinkedGeoPolygon polygon;
+        // 2-ring in random order
+        H3Index set[] = {
+            0x89300628393ffff, 0x89300628383ffff, 0x89300628397ffff,
+            0x89300628067ffff, 0x89300628387ffff, 0x893006283bbffff,
+            0x89300628313ffff, 0x893006283cfffff, 0x89300628303ffff,
+            0x89300628317ffff, 0x8930062839bffff, 0x8930062838bffff,
+            0x8930062806fffff, 0x8930062838fffff, 0x893006283d3ffff,
+            0x893006283c3ffff, 0x8930062831bffff, 0x893006283d7ffff,
+            0x893006283c7ffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 1, "1 loop added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == (6 * (2 * 2 + 1)),
+                 "Expected number of coords added to loop");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(nestedDonut) {
+        LinkedGeoPolygon polygon;
+        // hollow 1-ring + hollow 3-ring around the same hex
+        H3Index set[] = {
+            0x89283082813ffff, 0x8928308281bffff, 0x8928308280bffff,
+            0x8928308280fffff, 0x89283082807ffff, 0x89283082817ffff,
+            0x8928308289bffff, 0x892830828d7ffff, 0x892830828c3ffff,
+            0x892830828cbffff, 0x89283082853ffff, 0x89283082843ffff,
+            0x8928308284fffff, 0x8928308287bffff, 0x89283082863ffff,
+            0x89283082867ffff, 0x8928308282bffff, 0x89283082823ffff,
+            0x89283082837ffff, 0x892830828afffff, 0x892830828a3ffff,
+            0x892830828b3ffff, 0x89283082887ffff, 0x89283082883ffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedPolygons(&polygon) == 2, "Polygon count correct");
+
+        LinkedGeoPolygon *big = findLinkedPolygonByOuterCount(&polygon, 42);
+        t_assert(big != NULL, "Found big polygon by outer count");
+        t_assert(countLinkedLoops(big) == 2,
+                 "Loop count on big polygon correct");
+        t_assert(countLinkedCoords(big->first->next) == 30,
+                 "Got expected big inner loop");
+
+        LinkedGeoPolygon *small = findLinkedPolygonByOuterCount(&polygon, 18);
+        t_assert(small != NULL, "Found small polygon by outer count");
+        t_assert(countLinkedLoops(small) == 2,
+                 "Loop count on small polygon correct");
+        t_assert(countLinkedCoords(small->first->next) == 6,
+                 "Got expected small inner loop");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(nestedDonutTransmeridian) {
+        LinkedGeoPolygon polygon;
+        // hollow 1-ring + hollow 3-ring around the hex at (0, -180)
+        H3Index set[] = {
+            0x897eb5722c7ffff, 0x897eb5722cfffff, 0x897eb572257ffff,
+            0x897eb57220bffff, 0x897eb572203ffff, 0x897eb572213ffff,
+            0x897eb57266fffff, 0x897eb5722d3ffff, 0x897eb5722dbffff,
+            0x897eb573537ffff, 0x897eb573527ffff, 0x897eb57225bffff,
+            0x897eb57224bffff, 0x897eb57224fffff, 0x897eb57227bffff,
+            0x897eb572263ffff, 0x897eb572277ffff, 0x897eb57223bffff,
+            0x897eb572233ffff, 0x897eb5722abffff, 0x897eb5722bbffff,
+            0x897eb572287ffff, 0x897eb572283ffff, 0x897eb57229bffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedPolygons(&polygon) == 2, "Polygon count correct");
+
+        LinkedGeoPolygon *big = findLinkedPolygonByOuterCount(&polygon, 42);
+        t_assert(big != NULL, "Found big polygon by outer count");
+        t_assert(countLinkedLoops(big) == 2,
+                 "Loop count on big polygon correct");
+        t_assert(countLinkedCoords(big->first->next) == 30,
+                 "Got expected big inner loop");
+
+        LinkedGeoPolygon *small = findLinkedPolygonByOuterCount(&polygon, 18);
+        t_assert(small != NULL, "Found small polygon by outer count");
+        t_assert(countLinkedLoops(small) == 2,
+                 "Loop count on small polygon correct");
+        t_assert(countLinkedCoords(small->first->next) == 6,
+                 "Got expected small inner loop");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(contiguous2distorted) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x894cc5365afffff, 0x894cc536537ffff};
+        int numHexes = ARRAY_SIZE(set);
+
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedLoops(&polygon) == 1, "1 loop added to polygon");
+        t_assert(countLinkedCoords(polygon.first) == 12,
+                 "All coords added to loop except 2 shared");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(negativeHashedCoordinates) {
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0x88ad36c547fffff, 0x88ad36c467fffff};
+        int numHexes = ARRAY_SIZE(set);
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(set, numHexes, &polygon));
+
+        t_assert(countLinkedPolygons(&polygon) == 2, "2 polygons added");
+        t_assert(countLinkedLoops(&polygon) == 1,
+                 "1 loop on the first polygon");
+        t_assert(countLinkedCoords(polygon.first) == 6,
+                 "All coords for one hex added to first loop");
+        t_assert(countLinkedLoops(polygon.next) == 1,
+                 "Loop count on second polygon correct");
+        t_assert(countLinkedCoords(polygon.next->first) == 6,
+                 "All coords for one hex added to second polygon");
+
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+
+    TEST(specificLeak) {
+        // Test for a case where a leak can occur, detected by fuzzer.
+        // The leak detection part will be enforced here by valgrind.
+        LinkedGeoPolygon polygon;
+        H3Index set[] = {0xd60006d60000f100, 0x3c3c403c1300d668};
+        int numHexes = ARRAY_SIZE(set);
+        t_assert(H3_EXPORT(cellsToLinkedMultiPolygon)(
+                     set, numHexes, &polygon) == E_CELL_INVALID,
+                 "invalid cells fail");
+    }
+
+    TEST(gridDiskResolutions) {
+        // This is a center-face base cell, no pentagon siblings
+        H3Index baseCell = 0x8073fffffffffff;
+        H3Index origin = baseCell;
+
+        H3Index indexes[19] = {0};
+        int numHexes = ARRAY_SIZE(indexes);
+
+        for (int res = 1; res < 15; res++) {
+            // Take the 2-disk of the center child at res
+            t_assertSuccess(
+                H3_EXPORT(cellToCenterChild)(baseCell, res, &origin));
+            t_assertSuccess(H3_EXPORT(gridDisk)(origin, 2, indexes));
+
+            // Test the polygon output
+            LinkedGeoPolygon polygon;
+            t_assertSuccess(H3_EXPORT(cellsToLinkedMultiPolygon)(
+                indexes, numHexes, &polygon));
+            t_assert(countLinkedPolygons(&polygon) == 1, "1 polygon added");
+            t_assert(countLinkedLoops(&polygon) == 1,
+                     "1 loop on the first polygon");
+            t_assert(countLinkedCoords(polygon.first) == 30,
+                     "All coords for all hexes added to first loop");
+
+            H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+        }
+    }
+
+    TEST(gridDiskResolutionsPentagon) {
+        // This is a pentagon base cell
+        H3Index baseCell = 0x8031fffffffffff;
+        H3Index origin = baseCell;
+
+        H3Index diskIndexes[7] = {0};
+        H3Index indexes[6] = {0};
+
+        for (int res = 1; res < 15; res++) {
+            // Take the 1-disk of the center child at res. Note: We can't take
+            // the 2-disk here, as increased distortion around the pentagon will
+            // still fail at res 1. TODO: Use a 2-ring, start at res 0
+            // when output is correct.
+            t_assertSuccess(
+                H3_EXPORT(cellToCenterChild)(baseCell, res, &origin));
+            t_assertSuccess(H3_EXPORT(gridDisk)(origin, 1, diskIndexes));
+
+            int j = 0;
+            for (int i = 0; i < 7; i++) {
+                if (diskIndexes[i]) indexes[j++] = diskIndexes[i];
+            }
+            t_assert(j == 6, "Filled all 6 indexes");
+
+            // Test the polygon output
+            LinkedGeoPolygon polygon;
+            t_assertSuccess(
+                H3_EXPORT(cellsToLinkedMultiPolygon)(indexes, 6, &polygon));
+            t_assert(countLinkedPolygons(&polygon) == 1, "1 polygon added");
+            t_assert(countLinkedLoops(&polygon) == 1,
+                     "1 loop on the first polygon");
+            t_assert(countLinkedCoords(polygon.first) == 15,
+                     "All coords for all hexes added to first loop");
+
+            H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+        }
+    }
+
+    // The children of a cell always form a single polygon with no holes.
+    // Regression test for https://github.com/uber/h3/issues/917, where a
+    // previous implementation matched shared vertexes by hashing their
+    // floating point coordinates, and produced extra loops or polygons for
+    // the children of some pentagons and hexagons.
+    TEST(childrenOfCell) {
+        iterateAllIndexesAtRes(0, children_assertions);
+        iterateAllIndexesAtRes(1, children_assertions);
+        iterateAllIndexesAtRes(0, grandchildren_assertions);
+    }
+
+    // Global polygon: a continuous band of res-1 cells around the equator.
+    TEST(globalEquatorCells) {
+        H3Index cells[] = {
+            0x81807ffffffffff, 0x817efffffffffff, 0x81723ffffffffff,
+            0x817ebffffffffff, 0x817c3ffffffffff, 0x817e3ffffffffff,
+            0x817a3ffffffffff, 0x8166fffffffffff, 0x8172bffffffffff,
+            0x816afffffffffff, 0x81933ffffffffff, 0x8168fffffffffff,
+            0x8188fffffffffff, 0x81853ffffffffff, 0x817f7ffffffffff,
+            0x8180bffffffffff, 0x81783ffffffffff, 0x81743ffffffffff,
+            0x8170bffffffffff, 0x8173bffffffffff, 0x8179bffffffffff,
+            0x817cbffffffffff, 0x8188bffffffffff, 0x81857ffffffffff,
+            0x816f7ffffffffff, 0x8177bffffffffff, 0x81617ffffffffff,
+            0x816f3ffffffffff, 0x8174bffffffffff, 0x8180fffffffffff,
+            0x817a7ffffffffff, 0x81767ffffffffff, 0x81757ffffffffff,
+            0x81957ffffffffff, 0x81787ffffffffff, 0x81847ffffffffff,
+            0x81653ffffffffff, 0x817bbffffffffff, 0x816cfffffffffff,
+            0x816abffffffffff, 0x815f3ffffffffff, 0x817c7ffffffffff,
+            0x8168bffffffffff, 0x818cbffffffffff, 0x818cfffffffffff,
+            0x818afffffffffff, 0x8174fffffffffff, 0x8172fffffffffff,
+            0x8170fffffffffff, 0x816fbffffffffff, 0x81657ffffffffff,
+            0x816c7ffffffffff, 0x8186bffffffffff, 0x81763ffffffffff,
+            0x818a7ffffffffff, 0x8186fffffffffff, 0x81707ffffffffff,
+            0x8182bffffffffff, 0x818f3ffffffffff, 0x8182fffffffffff,
+        };
+        int numCells = ARRAY_SIZE(cells);
+
+        LinkedGeoPolygon polygon;
+        t_assertSuccess(
+            H3_EXPORT(cellsToLinkedMultiPolygon)(cells, numCells, &polygon));
+        H3_EXPORT(destroyLinkedMultiPolygon)(&polygon);
+    }
+}

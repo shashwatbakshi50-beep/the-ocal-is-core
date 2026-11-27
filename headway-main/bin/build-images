@@ -1,0 +1,191 @@
+#!/bin/bash -e
+set -o pipefail
+
+# Default values
+PUBLISH=false
+TAGS="latest"
+BRANDING=""
+FILTERS=()
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --publish)
+      PUBLISH=true
+      shift
+      ;;
+    --tags)
+      TAGS="$2"
+      shift 2 ;;
+    --branding)
+      BRANDING="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--publish] [--tags TAGS] [--branding BRAND] [FILTER...]"
+      echo ""
+      echo "Arguments:"
+      echo "  FILTER         Only build images whose name contains FILTER (can specify multiple)"
+      echo ""
+      echo "Options:"
+      echo "  --publish      Publish images to registry instead of local docker export"
+      echo "  --tags TAGS    Comma-separated image tags (default: latest)"
+      echo "  --branding B   Branding for web container (default: none)"
+      echo ""
+      echo "Examples:"
+      echo "  $0                              # Build all images"
+      echo "  $0 tileserver                   # Build tileserver and tileserver-init"
+      echo "  $0 tileserver headway           # Build tileserver, tileserver-init, headway, headway-init"
+      echo "  $0 --tags dev                   # Export dev tag to local docker"
+      echo "  $0 --tags \"latest,v1.0.0\"       # Export multiple tags to local docker"
+      echo "  $0 --publish --tags dev         # Publish dev tag to remote registry"
+      echo "  $0 --publish --tags \"latest,v1.0.0\" --branding maps.earth"
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option $1"
+      exit 1
+      ;;
+    *)
+      FILTERS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+function should_build() {
+  local container=$1
+  if [ ${#FILTERS[@]} -eq 0 ]; then
+    return 0
+  fi
+  for filter in "${FILTERS[@]}"; do
+    if [[ "$container" == *"$filter"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+function build_image() {
+  local build_function=$1
+  if [ -z "$build_function" ]; then
+    echo "missing 'build_function' arg"
+    exit 1
+  fi
+  local container=$2
+  if [ -z "$container" ]; then
+    echo "missing 'container' arg"
+    exit 1
+  fi
+  local addresses=$3
+  if [ -z "$addresses" ]; then
+    echo "missing 'addresses' arg"
+    exit 1
+  fi
+
+  if [ "$PUBLISH" = true ]; then
+    echo "Publishing ${container}: ${addresses}"
+    traced "$container" dagger --progress=plain -c "publish-multi --container=\$(${build_function}) --addresses=${addresses} --revision-label=$(git describe --always --dirty --abbrev=40 --exclude='*')"
+  else
+    # Export to the first tag and `docker tag` the rest, which keeps all tags
+    # pointing at the same image id locally.
+    IFS=',' read -ra _addr_list <<< "$addresses"
+    local primary="${_addr_list[0]}"
+    echo "Exporting ${container} to local docker: ${primary}"
+    traced "$container" dagger --progress=plain -c "${build_function} | export-image \"${primary}\""
+    for extra in "${_addr_list[@]:1}"; do
+      echo "Tagging ${extra} -> ${primary}"
+      docker tag "$primary" "$extra"
+    done
+  fi
+}
+
+function build_image_tags() {
+    local tags_input=$1
+    if [ -z "$tags_input" ]; then
+        echo "missing required 'tags' argument"
+        exit 1
+    fi
+
+    # Determine web branding parameter
+    local web_branding_param=""
+    if [ -n "$BRANDING" ]; then
+        web_branding_param="--branding=$BRANDING"
+    fi
+
+    HEADWAY_IMAGE_REPO="${HEADWAY_IMAGE_REPO:-ghcr.io/headwaymaps}"
+
+    # Convert comma/space separated tags to array, dropping empties
+    IFS=', ' read -ra tag_array <<< "$tags_input"
+    local tags=()
+    for tag in "${tag_array[@]}"; do
+        [ -n "$tag" ] && tags+=("$tag")
+    done
+
+    if [ ${#tags[@]} -eq 0 ]; then
+        echo "no tags provided"
+        exit 1
+    fi
+
+    # Build comma-separated "repo/container:tag" list for one image across all tags.
+    function addresses_for() {
+        local container=$1
+        local out=""
+        for tag in "${tags[@]}"; do
+            out+="${HEADWAY_IMAGE_REPO}/${container}:${tag},"
+        done
+        echo "${out%,}"
+    }
+
+    function build() {
+        local filter=$1
+        local build_function=$2
+        local container=$3
+        should_build "$filter" || return 0
+        # Every image builds at once, in its own dagger session, so prefix each
+        # line with the image it's about.
+        (build_image "$build_function" "$container" "$(addresses_for "$container")" 2>&1 \
+            | awk -v prefix="${container}: " '{ print prefix $0; fflush() }') &
+        pids+=($!)
+        containers+=("$container")
+    }
+
+    local pids=() containers=() failed=()
+
+    build "frontend"        "web-serve-container ${web_branding_param}" "headway"
+    build "frontend-init"   "web-init-container"                        "headway-init"
+    build "otp-init"        "otp-init-container"                        "opentripplanner-init"
+    build "otp"             "otp-serve-container"                       "opentripplanner"
+    build "transit-zoner"   "transit-zoner-serve-container"             "transit-zoner"
+    build "pelias-init"     "pelias-init-container"                     "pelias-init"
+    build "pelias-elasticsearch" "pelias-elasticsearch-container"       "pelias-elasticsearch"
+    build "tileserver"      "tileserver-serve-container"                "tileserver"
+    build "tileserver-init" "tileserver-init-container"                 "tileserver-init"
+    build "travelmux"       "travelmux-serve-container"                 "travelmux"
+    build "valhalla-init"   "valhalla-init-container"                   "valhalla-init"
+    build "valhalla"        "valhalla-serve-container"                  "valhalla"
+
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || failed+=("${containers[$i]}")
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+        echo "Failed to build: ${failed[*]}" >&2
+        exit 1
+    fi
+}
+
+APP_ROOT=$(git rev-parse --show-toplevel)
+cd "$APP_ROOT"
+source bin/_trace.sh
+trace_start images
+trap trace_finish EXIT
+
+echo "Mode: $([ "$PUBLISH" = true ] && echo "Publish" || echo "Export")"
+echo "Tags: $TAGS"
+if [ -n "$BRANDING" ]; then
+    echo "Branding: $BRANDING"
+fi
+
+build_image_tags "$TAGS"
+
+echo "Done!"

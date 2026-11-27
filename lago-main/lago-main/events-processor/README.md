@@ -1,0 +1,74 @@
+# Lago Events Processor
+
+High throughput events processor for Lago.
+This service is in charge of providing a post-process for events in high volume scenarios.
+
+This service need to be configured with Clickhouse and Redpanda. Please contact us for further informations.
+
+## How to run it
+
+With the docker compose environment:
+
+```shell
+go build -o event_processors .
+
+./event_processors
+```
+
+## Development
+
+### Running
+
+```shell
+lago up -d events-processor
+```
+
+### Testing
+
+```shell
+lago exec events-processor go test ./...
+```
+
+## Configuration
+
+This app requires some env vars
+
+| Variable                                    | Description                                                                                   |
+|---------------------------------------------|-----------------------------------------------------------------------------------------------|
+| ENV                                         | Set as `production` to not load `.env` file                                                   |
+| DATABASE_URL                                | PostgreSQL server URL (eg: `postgresql://lago_user:lago_password@lago_server:5432/lago_db`)   |
+| LAGO_KAFKA_BOOTSTRAP_SERVERS                | Kafka Brokers list URL with port (eg: `"redpanda:9092,kafka:9092"`)                                              |
+| LAGO_KAFKA_RAW_EVENTS_TOPIC                 | Events Kafka Topic (eg: `events_raw`)                                                         |
+| LAGO_KAFKA_ENRICHED_EVENTS_TOPIC            | Events Enriched Kafka Topic (eg: `events_enriched`)                                           |
+| LAGO_KAFKA_EVENTS_CHARGED_IN_ADVANCE_TOPIC  | Events Charge In Advance Kafka Topic (eg: `events_charge_in_advance`)                         |
+| LAGO_KAFKA_EVENTS_DEAD_LETTER_TOPIC         | Events pipeline only: dead letter queue (eg: `events_dead_letter`)                            |
+| LAGO_KAFKA_CONSUMER_GROUP                   | Kafka Consumer Group Name for Post Processing                                                 |
+| LAGO_EVENTS_PROCESSOR_PIPELINE              | `events` (default) or `product_events`. Each pipeline runs in its own deployment              |
+| LAGO_KAFKA_PRODUCT_RAW_EVENTS_TOPIC         | Product events pipeline only: raw product events (eg: `product_events_raw`)                   |
+| LAGO_KAFKA_PRODUCT_ENRICHED_EVENTS_TOPIC    | Product events pipeline only: enriched product events (eg: `product_events_enriched`)         |
+| LAGO_KAFKA_PRODUCT_EVENTS_DEAD_LETTER_TOPIC | Product events pipeline only: dead letter queue (eg: `product_events_dead_letter`)            |
+| LAGO_KAFKA_PRODUCT_EVENTS_CHARGED_IN_ADVANCE_TOPIC | Product events pipeline only, optional: events charged in advance (eg: `product_events_charged_in_advance`). Blank charges nothing in advance; set, the pipeline reads PostgreSQL even with the memory cache |
+| LAGO_REDIS_STORE_URL                        | Events pipeline only: Redis URL to store subscription refresh IDs                             |
+| LAGO_REDIS_CACHE_URL                        | Redis URL to store charge usage cache entries                                                 |
+
+
+Additionally there's a few optional environment variables
+
+| Variable                      | Description                                                                                                                        |
+|-------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| LAGO_REDIS_STORE_DB           | Redis database number to use for the store (default: 0)                                                                            |
+| LAGO_REDIS_STORE_PASSWORD     | Password for the Redis store (if required)                                                                                         |
+| LAGO_REDIS_STORE_TLS          | Redis TLS configuration for the Redis store (default: false)                                                                       |
+| LAGO_REDIS_CACHE_DB           | Redis database number to use for the cache (default: 0)                                                                            |
+| LAGO_REDIS_CACHE_PASSWORD     | Password for the Redis cache (if required)                                                                                         |
+| LAGO_REDIS_CACHE_TLS          | Redis TLS configuration for charge usage cache entries (default: false)                                                            |
+| LAGO_KAFKA_TLS                | Set to `true` if your broker uses TLS termination                                                                                  |
+| LAGO_KAFKA_SCRAM_ALGORITHM    | Your Broker SCRAM algo, supported values are `SCRAM-SHA-256` and `SCRAM-SHA-512`. <br> If you provide a SCRAM Algo, `LAGO_KAFKA_USERNAME` and `LAGO_KAFKA_PASSWORD` are required |
+| LAGO_KAFKA_USERNAME           | If your broker needs auth, your Kafka Username                                                                                     |
+| LAGO_KAFKA_PASSWORD           | If your broker needs auth, your Kafka password                                                                                     |
+| LAGO_KAFKA_USAGE_ATTRIBUTION_VALUES_TOPIC | Kafka topic on which the account tree values of enriched events are reported to the API (eg: `usage_attribution_values`). Nothing is reported when blank |
+| OTEL_SERVICE_NAME             | OpenTelemetry service name (eg: `events-processor`)                                                                                |
+| OTEL_EXPORTER_OTLP_ENDPOINT   | OpenTelemetry server URL. Setting this environment variable will enable tracing                                                    |
+| OTEL_INSECURE                 | Set to `true` to use the insecure mode of OpenTelemetry                                                                            |
+| LAGO_USE_MEMORY_CACHE         | Use the new in memory cache instead of DB calls                                                                                    |
+| LAGO_DEBEZIUM_TOPIC_PREFIX    | Mandatory if USE_MEMORY_CACHE is set to true, debezium kafka topic prefix (eg: `lago_dbz`)                                         |

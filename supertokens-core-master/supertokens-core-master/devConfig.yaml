@@ -1,0 +1,334 @@
+# Config for SuperTokens service. Here you will set the config params for
+# the main service as well as your database.
+# Some parameters are compulsory and are indicated via a (COMPULSORY) tag.
+# Others are optional and are indicated via a (OPTIONAL) tag.
+# To see the default values of the optional params are mentioned in the tag itself
+
+core_config_version: 0
+
+
+# (OPTIONAL | Default: 3567) integer value. The port at which SuperTokens service runs.
+# port:
+
+
+# (OPTIONAL | Default: "localhost") string value. The host on which SuperTokens service runs. Values here can
+# be localhost, example.com, 0.0.0.0 or any IP address associated with your machine
+# host:
+
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 3600) integer value. Time in seconds for how long an access token is
+# valid for.
+# access_token_validity:
+
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: false) boolean value. Deprecated, please see changelog. Only used in
+# CDI<=2.18 If true, allows for immediate revocation of any access token. Keep in mind that setting this to true will
+# result in a db query for each API call that requires authentication.
+# access_token_blacklisting:
+
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: true) boolean value. Deprecated, please see changelog.
+# If this is set to true, the access tokens created using CDI<=2.18 will be signed using a static signing key.
+# access_token_signing_key_dynamic:
+
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 168) integer value. Time in hours for how frequently the dynamic signing
+# key will change.
+# access_token_dynamic_signing_key_update_interval:
+
+# This is now deprecated, we only add this to the dev config to test if the fallback in the config parser works right
+# access_token_signing_key_update_interval:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 144000) double value. Time in mins for how long a refresh token is valid
+# for.
+# refresh_token_validity:
+
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 30) integer value. Time in seconds for how long the previously active
+# refresh token remains accepted after a rotation.
+# refresh_token_rotation_grace_period:
+
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 0.05) double value. Fraction between 0 and 0.25 by which access token
+# validity is randomly shortened at issuance. Applied subtractively so the token expiry is never lengthened. Set to 0
+# to disable.
+# access_token_validity_jitter:
+
+
+# (OPTIONAL | Default: "TOKEN_THEFT"). How the reuse of a recently rotated-out refresh token is reported. Values are
+# "TOKEN_THEFT" | "UNAUTHORISED". The session is revoked regardless of this setting.
+# recent_token_reuse_behaviour:
+
+# (OPTIONAL | Default: true) boolean value. If true, the core refuses to start when the base database is missing
+# tables or columns this version needs (a skipped manual migration), and tenant databases with a mismatched schema
+# are not served. If false, mismatches are only logged and just the queries touching the missing schema fail.
+# schema_check_strict_mode:
+
+# (OPTIONAL | Default: 120) int value. How long (seconds) the core waits at startup for a tenant storage to
+# initialise, counted from when its own initialisation starts. A storage that takes longer is logged as an error
+# and startup continues without it, while it keeps initialising in the background. The base storage is always
+# waited for. Must be >= 1.
+# storage_init_timeout_seconds:
+
+# (OPTIONAL | Default: 16) int value. How many tenant storages (connection pools) the core initialises at the same time
+# at startup. A higher value starts many tenant databases faster, a lower one sends fewer connections at once to a
+# database many tenants share. Each storage still initialising after storage_init_timeout_seconds lets one more storage
+# start, so while such storages are still running, more than this many can be initialising. Must be >= 1.
+# storage_init_parallelism:
+
+
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: 3600000) long value. Time in milliseconds for how long a password
+# reset token / link is valid for.
+# password_reset_token_lifetime:
+
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: 86400000 (1 day)) long value. Time in milliseconds for how long an
+# email verification token / link is valid for.
+# email_verification_token_lifetime:
+
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: 5) integer value. The maximum number of code input attempts per login
+# before the user needs to restart.
+# passwordless_max_code_input_attempts:
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: 900000) long value. Time in milliseconds for how long a passwordless
+# code is valid for.
+# passwordless_code_lifetime:
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: 5) integer value. The maximum number of invalid TOTP attempts that
+# will trigger rate limiting.
+# totp_max_attempts:
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: 900) integer value. The time in seconds for which the user will be
+# rate limited once totp_max_attempts is crossed.
+# totp_rate_limit_cooldown_sec:
+
+# (OPTIONAL | Default: installation directory/logs/info.log) string value. Give the path to a file (on your local
+# system) in which the SuperTokens service can write INFO logs to. Set it to "null" if you want it to log to
+# standard output instead.
+# info_log_path:
+
+
+# (OPTIONAL | Default: installation directory/logs/error.log) string value. Give the path to a file (on your local
+# system) in which the SuperTokens service can write ERROR logs to. Set it to "null" if you want it to log to
+# standard error instead
+# error_log_path:
+
+
+# (OPTIONAL | Default: 10) integer value. Sets the max thread pool size for incoming http server requests.
+# max_server_pool_size:
+
+
+# (OPTIONAL | Default: 0) integer value. Maximum number of requests from one connection URI domain that may be in flight
+# at the same time. Only requests that pass the API-key check for an app that exists under the domain count toward it;
+# requests to routes without an API-key check (e.g. /hello, /livez, /.well-known/jwks.json) and requests naming an app
+# that does not exist only add to the pool's saturation and are never capped. Requests on the admin port (admin_port)
+# bypass both the cap and the saturation count. This is a fair-share rule, enforced only while the request pool is
+# saturated (see concurrency_cap_reserved_pool_percent): a connection URI domain over its cap then gets HTTP 429
+# immediately instead of a thread; below that, no request is ever rejected. Must be the same for all apps/tenants under
+# a connection URI domain and cannot exceed max_server_pool_size. 0 disables the cap.
+# max_concurrent_requests_per_cud:
+
+
+# (OPTIONAL | Default: 25) integer value. Share of max_server_pool_size (percent) kept free for connection URI
+# domains under their max_concurrent_requests_per_cud. The per-tenant cap is only enforced once the pool has fewer
+# free threads than this; below that, tenants may exceed their cap. 100 keeps no headroom, so the cap is always
+# enforced (a hard cap). Must be between 1 and 100.
+# concurrency_cap_reserved_pool_percent:
+
+# (OPTIONAL | Default: 600000) long value. How old, in milliseconds, a full user count may be before it is counted
+# again. Telemetry's user count, the license-usage stats and the unfiltered tenant count of /users/count on CDI 5.7
+# (or 5.6 with allowApproximate) are the last full count plus the sign-ups, deletions and links logged since; the full
+# count is shared by every core through the database and redone once it is older than this, so a lower value means
+# fresher counts but more full counts on the database. While a burst (e.g. a bulk import) is being rolled into the
+# count, /users/count gets the count as of before it, with an older asOf. Other /users/count calls are exact counts and
+# are not affected. Only read from the base config.
+# users_count_max_age_ms:
+
+
+# (OPTIONAL | Default: null) integer value. The port for a second webserver connector that serves liveness and
+# control-plane routes from a thread pool separate from the data-plane pool. When set to null, the admin connector
+# is disabled and all routes are served on the main port exactly as before.
+# The admin port is NOT a separate trust boundary: it applies the same 'api_keys' and IP-allow rules as the main
+# port, binds the same 'host', and has no credential of its own. It carries sensitive routes (e.g. '/ee/license',
+# which sets the license key, and '/global-request-stats'), so it is meant for the orchestrator / control plane
+# and should not be exposed beyond the network boundary your liveness check and control plane already live in.
+# admin_port:
+
+
+# (OPTIONAL | Default: 5) integer value. Sets the max thread pool size for requests to the admin connector. Only
+# used when admin_port is set.
+# admin_max_server_pool_size:
+
+
+# (OPTIONAL | Default: null) comma separated string values. Comma-separated list of API paths to serve only on the
+# admin port, overriding their compiled-in route scope (e.g. '/ee/license'). Each entry must match a known API path,
+# and admin_port must be set.
+# admin_only_paths:
+
+
+# (OPTIONAL | Default: null) comma separated string values. Comma-separated list of API paths to serve on both the
+# admin and main ports, overriding their compiled-in route scope. Each entry must match a known API path, and
+# admin_port must be set.
+# admin_preferred_paths:
+
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: no API keys) comma separated string values. The API keys to query an
+# instance using this config file. The format is "key1,key2,key3". Keys can only contain '=', '-' and alpha-numeric
+# (including capital) chars. Each key must have a minimum length of 20 chars
+# api_keys:
+
+
+# DIFFERENT_ACROSS_APPS | Important: This is set to true here but is uncommented in config.yaml. The reason is that
+# when testing with drivers or in CICD, we do not want to send telemetry data. For unit tests, this is commented
+# again in Utils.reset function (in the test package)
+disable_telemetry: true
+
+# (OPTIONAL | Default: ""). Used to prepend a base path to all APIs when querying the core.
+# base_path:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: "BCRYPT"). The password hashing algorithm to use. Values are "ARGON2" |
+# "BCRYPT"
+# password_hashing_alg:
+
+# (OPTIONAL | Default: 11). Number of rounds to set for bcrypt password hashing
+bcrypt_log_rounds: 4
+
+# (OPTIONAL | Default: 1). Number of iterations for argon2 password hashing
+# argon2_iterations:
+
+# (OPTIONAL | Default: 87795 (85 mb)). Amount of memory in kb for argon2 password hashing
+# argon2_memory_kb:
+
+# (OPTIONAL | Default: 2). Amount of parallelism for argon2 password hashing
+# argon2_parallelism:
+
+# (OPTIONAL | Default: 1). Number of concurrent argon2 hashes that can happen at the same time for sign up or sign
+# in requests.
+# argon2_hashing_pool_size:
+
+# (OPTIONAL | Default: "INFO"). Logging level for the core. Values are "DEBUG" | "INFO" | "WARN" | "ERROR" | "NONE"
+# log_level:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: null). The signer key used for firebase scrypt password hashing
+# firebase_password_hashing_signer_key:
+
+# (OPTIONAL | Default: 1). Number of concurrent firebase scrypt hashes that can happen at the same time for sign in requests.
+# firebase_password_hashing_pool_size:
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: null). Regex for allowing requests from IP addresses that match with
+# the value. For example, use the value of 127\.\d+\.\d+\.\d+|::1|0:0:0:0:0:0:0:1 to allow only localhost to query the
+# core. Comment it out to allow requests from any IP address.
+# ip_allow_regex:
+
+# (DIFFERENT_ACROSS_TENANTS | OPTIONAL | Default: null). Regex for denying requests from IP addresses that match with
+# the value. Comment this value to deny no IP address.
+# ip_deny_regex:
+
+# (OPTIONAL | Default: null). This is used when deploying the core in SuperTokens SaaS infrastructure. If set, limits
+# what database information is shown to / modifiable by the dev when they query the core to get the information about
+# their tenants. It only exposes that information when this key is used instead of the regular api_keys config.
+# supertokens_saas_secret:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: null). This is used when the core needs to assume a specific CDI version
+# when CDI version is not specified in the request. When set to null, the core will assume the latest version of the
+# CDI.
+# supertokens_max_cdi_version:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: null). The minimum CDI version that the core will accept. Requests
+# using a CDI version lower than this are rejected with a 400. When set to null, all CDI versions supported by the
+# core are accepted.
+# supertokens_min_cdi_version:
+
+# (OPTIONAL | Default: null) string value. If specified, the supertokens service will only load the specified CUD even
+# if there are more CUDs in the database and block all other CUDs from being used from this instance.
+# supertokens_saas_load_only_cud:
+
+# (OPTIONAL | Default: null) string value. If specified, the core uses this URL to connect to the OAuth provider
+# public service.
+# oauth_provider_public_service_url:
+
+# (OPTIONAL | Default: null) string value. If specified, the core uses this URL to connect to the OAuth provider admin
+# service.
+# oauth_provider_admin_service_url:
+
+# (OPTIONAL | Default: null) string value. If specified, the core uses this URL to replace the default
+# consent and login URLs to {apiDomain}.
+# oauth_provider_consent_login_base_url:
+
+# (OPTIONAL | Default: oauth_provider_public_service_url) If specified, the core uses this URL to parse responses from
+# the oauth provider when the oauth provider's internal address differs from the known public provider address.
+# oauth_provider_url_configured_in_oauth_provider:
+
+# (Optional | Default: null) string value. The encryption key used for saving OAuth client secret on the database.
+# oauth_client_secret_encryption_key:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: number of available processor cores) int value. If specified,
+# the supertokens core will use the specified number of threads to complete the migration of users.
+# bulk_migration_parallelism:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 8000) int value. If specified, the supertokens core will load the
+# specified number of users for migrating in one single batch.
+# bulk_migration_batch_size:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 1000) int value. If specified, the bulk migration will wait between
+# rounds. To disable it, set it to null.
+# bulk_migration_sleep_between_rounds_in_batch_ms:
+
+# (OPTIONAL | Default: 31) int value. Number of days of activity_log entries to retain; older entries are dropped
+# by a periodic cleanup. Must be the same for all apps/tenants under a connection URI domain.
+# activity_log_retention_days:
+
+# (OPTIONAL | Default: true) boolean value. If true, throttled activity events (token_refresh, oauth_token_exchange,
+# oauth_authorize) are collapsed to at most one activity_log write per (app, user) every 5 minutes, so a burst of
+# refreshes does not turn into a per-request insert. sign_in, session_create and sign_out are never throttled. Set to
+# false to record every activity event as its own row (a complete audit trail) at the cost of that write volume. Must be
+# the same for all apps/tenants under a connection URI domain.
+# activity_log_throttle_enabled:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: 3600000) long value. Time in milliseconds for how long a webauthn
+# account recovery token is valid for.
+# webauthn_recover_account_token_lifetime:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: false) boolean value. If true, the core rejects creating user id
+# mappings, updating their externalUserIdInfo and bulk-importing users with an externalUserId (removing mappings is
+# still allowed), and neither the core nor the storage reads user id mappings for this app. It cannot be turned on while
+# the app has user id mappings, unless disable_user_id_mapping_force is also true. When it is turned on through the
+# config API, turning it on and creating a mapping exclude each other through a database lock, and mapping creation
+# checks the stored config, so a core that hasn't refreshed its config yet can't create one either. When it is set in
+# config.yaml or env, each core uses its own value until it restarts, so stop creating mappings before rolling it out,
+# and a core doesn't start while an app it applies to has user id mappings. While it is on, the app can't move to, or
+# add a tenant on, a database the core hasn't loaded yet (turn it off, make the change, then turn it back on). If a core
+# otherwise finds user id mappings for the app when it loads its databases (for example, in a restored database, or in
+# one still initialising when startup finishes), it keeps reading them and logs an error until they are removed.
+# disable_user_id_mapping:
+
+# (DIFFERENT_ACROSS_APPS | OPTIONAL | Default: false) boolean value. If true together with disable_user_id_mapping, that
+# flag can be turned on while the app has user id mappings, and those mappings are ignored: neither the core nor the
+# storage reads them, and data stored under their external ids (TOTP devices, metadata, roles) no longer applies to
+# those users. Sessions created under an external id before that stay valid, and listing or revoking a user's sessions
+# by either its SuperTokens user id or its external id includes the sessions stored under both. If a mapping was
+# created with `force: true` on POST /recipe/userid/map and its external id is another user's SuperTokens user id,
+# listing or revoking either user's sessions includes the other user's sessions too. It can't be turned off while the
+# app has user id mappings. Has no effect while disable_user_id_mapping is false.
+# disable_user_id_mapping_force:
+
+# (OPTIONAL | Default: null) string value. The URL of the OpenTelemetry collector to which the core
+# will send telemetry data. This should be in the format http://<host>:<port> or https://<host>:<port>.
+# otel_collector_connection_uri:
+
+# (OPTIONAL | Default: false) boolean value. Enables or disables the deadlock logger.
+# deadlock_logger_enable:
+
+# (OPTIONAL | Default: null) string value. If specified, uses this URL as ACS URL for handling legacy SAML clients
+saml_legacy_acs_url: "http://localhost:5225/api/oauth/saml"
+
+# (OPTIONAL | Default: https://saml.supertokens.com) string value. Service provider's entity ID.
+# saml_sp_entity_id:
+
+# OPTIONAL | Default: 300000) long value. Duration for which SAML claims will be valid before it is consumed
+# saml_claims_validity:
+
+# OPTIONAL | Default: 300000) long value. Duration for which SAML relay state will be valid before it is consumed
+# saml_relay_state_validity:

@@ -1,0 +1,10 @@
+##
+# The following are only needed for the scripts in bin/*
+# If you're not using them, we can leave these blank.
+##
+
+# Where artifacts are actually downloaded from, by k8s init containers and builds
+DEPLOYMENT_ARTIFACT_ROOT="https://data.example.com"
+
+# Where bin/refresh-hosted-fixtures writes the third party files that builds download, on the data host
+BUILD_FIXTURES_DIR="/srv/www/data.example.com/build_fixtures"

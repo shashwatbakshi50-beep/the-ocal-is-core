@@ -1,0 +1,37 @@
+#!/bin/bash
+# One-shot integration test runner for Headway
+# Starts services, runs tests, and cleans up
+
+set -e
+
+# The tests assert against Bogota - its coordinates, its transit - so the build they run
+# against isn't interchangeable.
+CONFIG_DIR="builds/Bogota"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$APP_ROOT"
+
+source bin/_source-env.sh "$CONFIG_DIR"
+source bin/_transit-zones.sh
+
+echo "========================================"
+echo "Headway Integration Test Runner"
+echo "========================================"
+echo "Build dir: $CONFIG_DIR"
+echo ""
+
+cleanup() {
+    echo ""
+    "$APP_ROOT/bin/stop-and-remove-services" "$CONFIG_DIR"
+}
+trap cleanup EXIT INT TERM
+
+"$APP_ROOT/bin/start-services" --no-follow-logs "$CONFIG_DIR"
+
+echo ""
+echo "Waiting for services to be ready..."
+"$APP_ROOT/bin/wait-for-services"
+
+echo ""
+"$SCRIPT_DIR/integration-tests" "$CONFIG_DIR"

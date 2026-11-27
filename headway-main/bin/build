@@ -1,0 +1,139 @@
+#!/bin/bash -e
+
+function status() {
+    echo "==> $*" >&2
+}
+
+APP_ROOT=$(git rev-parse --show-toplevel)
+cd "$APP_ROOT"
+
+function usage() {
+    cat <<EOS
+usage: $0 <build-config-dir> [artifact...]
+
+Builds every artifact, or only those named by their artifacts.json key:
+    osm pmtiles valhalla elasticsearch placeholder terrain landcover
+    otp-graphs gtfs              (all transit zones)
+    otp-graphs.<zone>            (one zone's graph and GTFS)
+
+e.g.
+    $0 builds/planet
+    $0 builds/planet pmtiles
+    $0 builds/Seattle otp-graphs
+    $0 builds/planet otp-graphs.london
+EOS
+}
+
+CONFIG_DIR="${1:-}"
+case "$CONFIG_DIR" in
+    "")
+        usage
+        exit 1
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+esac
+shift
+
+set -o nounset
+
+ONLY=("$@")
+
+# Everything but terrain and landcover is built from the area's PBF.
+NEEDS_PBF=$([ ${#ONLY[@]} -eq 0 ] && echo 1 || echo 0)
+for artifact in "${ONLY[@]+"${ONLY[@]}"}"; do
+    case "$artifact" in
+        terrain | landcover) ;;
+        *) NEEDS_PBF=1 ;;
+    esac
+done
+
+if [ ! -d "$CONFIG_DIR" ]; then
+    cat <<EOS
+Config dir "$CONFIG_DIR" doesn't exist
+EOS
+    exit 1
+fi
+
+source bin/_source-env.sh "$CONFIG_DIR"
+source bin/_trace.sh
+
+# Printed last, under the timing summary.
+function next_steps() {
+    cat <<EOS
+
+Artifacts pinned in ${CONFIG_DIR}/artifacts.json. Publish and deploy them with:
+
+    bin/publish-data ${CONFIG_DIR} [--host remote.host.com]
+    bin/k8s/deploy ${CONFIG_DIR}
+EOS
+}
+
+status "Building ${HEADWAY_AREA} from ${CONFIG_DIR}"
+
+trace_start "$HEADWAY_AREA"
+trap 'exit_code=$?; trace_finish; [ $exit_code -ne 0 ] || next_steps' EXIT
+
+if [ "$NEEDS_PBF" -eq 1 ] && [ -f "${CONFIG_DIR}/prebuild.sh" ]; then
+    status "Running ${CONFIG_DIR}/prebuild.sh"
+    traced prebuild "${CONFIG_DIR}/prebuild.sh"
+fi
+
+USE_LOCAL_PBF=""
+INPUT_PBF="${HEADWAY_AREA}.osm.pbf"
+if [ -f "$INPUT_PBF" ]; then
+    USE_LOCAL_PBF="--local-pbf ${INPUT_PBF}"
+fi
+
+TRANSIT_CONFIG_DIR="$CONFIG_DIR/transit"
+USE_TRANSIT_FLAGS=""
+if [ -d "$TRANSIT_CONFIG_DIR" ]; then
+    USE_TRANSIT_FLAGS="--transit-dir=${TRANSIT_CONFIG_DIR}"
+
+    # Feeds that need a credential take it from the gitignored file at the repo
+    # root. Dagger must receive it explicitly because module code is sandboxed.
+    GTFS_SECRETS_FILE="${APP_ROOT}/gtfs-secrets.json"
+    if [ -f "$GTFS_SECRETS_FILE" ]; then
+        USE_TRANSIT_FLAGS="${USE_TRANSIT_FLAGS} --gtfs-secrets file://${GTFS_SECRETS_FILE}"
+    fi
+fi
+
+USE_DRIVING_SIDE_FLAG=""
+if [ -n "${HEADWAY_DRIVING_SIDE:-}" ]; then
+    USE_DRIVING_SIDE_FLAG="--driving-side=${HEADWAY_DRIVING_SIDE}"
+fi
+
+# Tiles from bin/build-elevation are used rather than downloaded.
+USE_ELEVATION_FLAG=""
+if [ -d data/elevation ]; then
+    USE_ELEVATION_FLAG="--elevation data/elevation"
+fi
+
+USE_BUILD_FIXTURES_FLAG=""
+if [ -n "${HEADWAY_BUILD_FIXTURES_URL:-}" ]; then
+    USE_BUILD_FIXTURES_FLAG="--build-fixtures-url=${HEADWAY_BUILD_FIXTURES_URL}"
+fi
+
+USE_OPENADDRESSES_FLAG=""
+if [ "$HEADWAY_COUNTRIES" = ALL ]; then
+    set -a
+    source .bin-env
+    set +a
+    if [ -z "${DEPLOYMENT_ARTIFACT_ROOT:-}" ]; then
+        echo "set DEPLOYMENT_ARTIFACT_ROOT in .bin-env to download OpenAddresses" >&2
+        exit 1
+    fi
+    USE_OPENADDRESSES_FLAG="--openaddresses-url=${DEPLOYMENT_ARTIFACT_ROOT}/openaddresses"
+fi
+
+USE_ONLY_FLAG=""
+if [ ${#ONLY[@]} -gt 0 ]; then
+    USE_ONLY_FLAG="--only=$(IFS=,; echo "${ONLY[*]}")"
+fi
+status "Building ${ONLY[*]:-all artifacts} into data/${HEADWAY_AREA}"
+traced dagger dagger -c "with-area ${HEADWAY_AREA} --countries=${HEADWAY_COUNTRIES} ${USE_LOCAL_PBF} ${USE_TRANSIT_FLAGS} ${USE_DRIVING_SIDE_FLAG} ${USE_ELEVATION_FLAG} ${USE_BUILD_FIXTURES_FLAG} ${USE_OPENADDRESSES_FLAG} | build ${USE_ONLY_FLAG} | export 'data/${HEADWAY_AREA}'"
+
+status "Pinning artifacts"
+bin/artifacts --pin "$CONFIG_DIR"

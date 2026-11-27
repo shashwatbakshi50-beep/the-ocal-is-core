@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>getlago/lago-packages//renovate/lago-bases-only"
+  ],
+  "enabledManagers": ["dockerfile", "gomod"],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "description": "Every Go security fix, any module, direct or indirect. Add no match* filter here. Routine updates stay off: the preset disables them.",
+    "enabled": true,
+    "postUpdateOptions": ["gomodTidy"]
+  }
+}

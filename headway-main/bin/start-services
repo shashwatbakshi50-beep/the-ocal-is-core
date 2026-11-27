@@ -1,0 +1,77 @@
+#!/bin/bash
+# Start docker compose services for integration testing
+
+set -e
+
+FOLLOW_LOGS=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-follow-logs)
+            FOLLOW_LOGS=0
+            shift
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+CONFIG_DIR="$1"
+if [ -z "$CONFIG_DIR" ]; then
+    cat <<EOS
+Usage: $0 [--no-follow-logs] <build-config-dir>
+
+Example:
+    $0 builds/Bogota
+Override the compose file:
+    COMPOSE_FILE=docker-compose.yaml $0 builds/Seattle
+Otherwise the compose file follows whether the build has any transit zones.
+EOS
+    exit 1
+fi
+
+APP_ROOT=$(git rev-parse --show-toplevel)
+cd $APP_ROOT
+
+source bin/_source-env.sh "$CONFIG_DIR"
+source bin/_compose-file.sh
+
+echo "========================================"
+echo "Starting Headway Services"
+echo "========================================"
+echo "Build dir: $CONFIG_DIR"
+echo "Compose file: $COMPOSE_FILE"
+echo ""
+
+echo "Area: ${HEADWAY_AREA}"
+echo "Data directory: data/${HEADWAY_AREA}"
+echo ""
+
+if [ ! -d "data/${HEADWAY_AREA}" ]; then
+    echo "Error: Data directory data/${HEADWAY_AREA} not found"
+    echo "Please run: bin/build $CONFIG_DIR"
+    exit 1
+fi
+
+bin/artifacts --verify "$CONFIG_DIR"
+
+# Start services - cd to build dir so docker-compose picks up the .env
+cd "$CONFIG_DIR"
+echo "Starting docker compose services from $CONFIG_DIR..."
+docker compose -f "../../$COMPOSE_FILE" up -d
+
+echo ""
+echo "Services started! Use bin/wait-for-services to check readiness."
+echo ""
+echo "To stop services and remove volumes, run:"
+echo "  bin/stop-and-remove-services $CONFIG_DIR"
+echo ""
+
+cd "$APP_ROOT"
+if [ "$FOLLOW_LOGS" -eq 1 ]; then
+    bin/docker-compose "$CONFIG_DIR" logs --follow
+fi

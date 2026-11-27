@@ -1,0 +1,323 @@
+name: Build Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Add any new jobs to "needs" to include it in GH's CI requirements
+  all_checks:
+    name: All checks
+    if: always()
+    needs:
+      - build_data
+      - build_images
+      - www_checks
+      - rust_checks
+      - k8s_checks
+      - integration_tests
+      - browser_tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report each job's result
+        run: |
+          echo "build_data:         ${{ needs.build_data.result }}"
+          echo "build_images:       ${{ needs.build_images.result }}"
+          echo "www_checks:         ${{ needs.www_checks.result }}"
+          echo "rust_checks:        ${{ needs.rust_checks.result }}"
+          echo "k8s_checks:         ${{ needs.k8s_checks.result }}"
+          echo "integration_tests:  ${{ needs.integration_tests.result }}"
+          echo "browser_tests:      ${{ needs.browser_tests.result }}"
+      # Anything that isn't a success fails this job, skipped included: a check
+      # that didn't run is not a check that passed.
+      - name: Fail unless every job succeeded
+        if: >-
+          ${{ contains(needs.*.result, 'failure')
+           || contains(needs.*.result, 'cancelled')
+           || contains(needs.*.result, 'skipped') }}
+        run: exit 1
+  build_data:
+    name: Build Bogota data artifacts
+    runs-on: ubuntu-latest
+    env:
+      DAGGER_NO_NAG: 1
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Dagger
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "latest"
+      - name: Install otel-cli
+        uses: $/.github/actions/install-otel-cli
+      - name: Copy .bin-env
+        run: cp .bin-env-example .bin-env
+      # bbbike intermittently times out from GitHub's runners. bin/build uses a
+      # Bogota.osm.pbf at the repo root instead of downloading one, so keep a
+      # cached copy there, fetched from our mirror when the cache is cold.
+      - name: Cache Bogota extract
+        id: bogota-pbf
+        uses: actions/cache@v6.1.0
+        with:
+          path: Bogota.osm.pbf
+          key: bogota-osm-pbf-v1
+      - name: Fetch Bogota extract
+        if: steps.bogota-pbf.outputs.cache-hit != 'true'
+        run: |
+          fetch() { curl --fail --location --retry 3 --retry-all-errors --connect-timeout 30 --max-time 600 -o Bogota.osm.pbf "$1"; }
+          fetch https://data.maps.earth/bbbike/Bogota/Bogota.osm.pbf \
+            || fetch https://download.bbbike.org/osm/bbbike/Bogota/Bogota.osm.pbf
+      - name: Pick Rust cache month
+        id: rust-cache
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      # Read-only: build_images saves this cache. Its builds already compile
+      # gtfout's dependencies, and with two writers the next run would restore
+      # whichever job finished last.
+      - name: Restore Rust build caches
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ~/rust-caches.tar.zst
+          key: dagger-rust-zst-${{ steps.rust-cache.outputs.month }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: dagger-rust-zst-${{ steps.rust-cache.outputs.month }}-
+      - name: Import Rust build caches
+        run: |
+          if [ -f ~/rust-caches.tar.zst ]; then
+            dagger call import-rust-caches --caches ~/rust-caches.tar.zst
+          fi
+      - name: Build data artifacts
+        run: bin/build builds/Bogota
+      - name: Upload data artifacts
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bogota-artifacts-${{ github.sha }}
+          path: data/Bogota
+          retention-days: 7
+      # The build re-pins artifacts.json to the names it just built, so the
+      # committed manifest is stale for dated artifacts (otp graphs, gtfs). Downstream
+      # jobs need this copy, not the checked-out one.
+      - name: Upload artifact manifest
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bogota-manifest-${{ github.sha }}
+          path: builds/Bogota/artifacts.json
+          retention-days: 7
+  build_images:
+    name: Build service images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Dagger
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "latest"
+      - name: Install otel-cli
+        uses: $/.github/actions/install-otel-cli
+      - name: Pick Rust cache month
+        id: rust-cache
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      # Shared with build_data, which only reads it. Only main writes it, so
+      # PR and merge-queue refs do not create isolated cache entries.
+      - name: Restore Rust build caches
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ~/rust-caches.tar.zst
+          key: dagger-rust-zst-${{ steps.rust-cache.outputs.month }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: dagger-rust-zst-${{ steps.rust-cache.outputs.month }}-
+      - name: Import Rust build caches
+        run: |
+          if [ -f ~/rust-caches.tar.zst ]; then
+            dagger call import-rust-caches --caches ~/rust-caches.tar.zst
+          fi
+      - name: Build service images
+        run: bin/build-images
+      - name: Export Rust build caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        timeout-minutes: 15
+        run: |
+          rm -f ~/rust-caches.tar.zst
+          df -h
+          dagger call export-rust-caches export --path ~/rust-caches.tar.zst
+          du -sh ~/rust-caches.tar.zst
+      - name: Show disk usage after failed export
+        if: failure()
+        run: df -h
+      - name: Save Rust build caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ~/rust-caches.tar.zst
+          key: dagger-rust-zst-${{ steps.rust-cache.outputs.month }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save Docker images
+        run: docker save $(docker images --format "{{.Repository}}:{{.Tag}}" | grep headway) | zstd -T0 > docker-images.tar.zst
+      - name: Upload Docker images
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: docker-images-${{ github.sha }}
+          path: docker-images.tar.zst
+          compression-level: 0
+          retention-days: 7
+  www_checks:
+    defaults:
+      run:
+        working-directory: services/frontend/www-app
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+      - run: npm install --global yarn
+      - run: yarn install
+      - run: yarn quasar prepare
+      - run: yarn lint
+      - run: yarn format-check
+      - run: yarn tsc
+      - run: yarn test
+  rust_checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo build --workspace --release --all-features
+  k8s_checks:
+    name: K8s config checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Copy .bin-env
+        run: cp .bin-env-example .bin-env
+      - name: Lint and render the chart for each deployment
+        run: |
+          for build in builds/planet builds/Seattle; do
+            bin/k8s/values "$build" > values.json
+            helm lint --strict k8s/chart --values values.json
+            helm template headway k8s/chart --values values.json > /dev/null
+          done
+  integration_tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build_data, build_images]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Download data artifacts
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: bogota-artifacts-${{ github.sha }}
+          path: data/Bogota
+      - name: Download artifact manifest
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: bogota-manifest-${{ github.sha }}
+          path: builds/Bogota
+      - name: Download Docker images
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: docker-images-${{ github.sha }}
+          path: .
+      - name: Load Docker images
+        run: zstd -dc docker-images.tar.zst | docker load
+      - name: Run integration tests
+        run: bin/test/integration-tests-oneshot
+      - name: Collect logs on failure
+        if: failure()
+        run: bin/docker-compose builds/Bogota logs > integration-test-logs.txt
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: integration-test-logs
+          path: integration-test-logs.txt
+  browser_tests:
+    name: Browser Tests
+    runs-on: ubuntu-latest
+    needs: [build_data, build_images]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+      - run: npm install --global yarn
+      - name: Install Playwright and Chrome
+        working-directory: tests/browser
+        run: |
+          yarn install --frozen-lockfile
+          npx playwright install --with-deps chrome
+      - name: Download data artifacts
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: bogota-artifacts-${{ github.sha }}
+          path: data/Bogota
+      - name: Download artifact manifest
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: bogota-manifest-${{ github.sha }}
+          path: builds/Bogota
+      - name: Download Docker images
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: docker-images-${{ github.sha }}
+          path: .
+      - name: Load Docker images
+        run: zstd -dc docker-images.tar.zst | docker load
+      - name: Start services
+        run: bin/start-services --no-follow-logs builds/Bogota
+      - name: Wait for services
+        run: bin/wait-for-services
+      - name: Run browser tests
+        run: bin/test/browser-tests builds/Bogota
+      - name: Collect logs on failure
+        if: failure()
+        run: bin/docker-compose builds/Bogota logs > browser-test-logs.txt
+      - name: Upload logs and Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: browser-test-artifacts
+          path: |
+            browser-test-logs.txt
+            tests/browser/playwright-report/
+            tests/browser/test-results/
+      - name: Stop services
+        if: always()
+        run: bin/stop-and-remove-services builds/Bogota

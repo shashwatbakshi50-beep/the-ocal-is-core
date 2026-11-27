@@ -1,0 +1,242 @@
+#!/bin/bash
+
+set -e
+
+APP_ROOT=$(git rev-parse --show-toplevel)
+cd "$APP_ROOT"
+
+function usage() {
+  cat << EOF
+Pin and look up build artifacts. --pin runs on the build machine: it reads
+data/<Area> and writes artifacts.json beside the build config.
+The lookups serve both the local docker compose stack and bin/k8s/deploy, so the
+manifest's shape is only known here.
+
+usage: $0 [--optional] <otp-graphs|otp-zones|pmtiles|valhalla|elasticsearch|placeholder|pelias-config|osm> <build-config-dir>
+       $0 [--optional] <terrain|landcover> <build-config-dir>
+       $0 <files|shared-files> <build-config-dir>
+       $0 --pin <build-config-dir>
+       $0 --verify <build-config-dir>
+
+Named artifact lookups fail if the manifest or pin is missing. Use
+--optional for optional lookups. Collection lookups may return no entries.
+Lookups only read pins; --verify checks that the files exist locally.
+
+examples: # pin the newest artifacts to builds/<Area>/artifacts.json
+    \$0 --pin builds/Amsterdam
+    # check every pinned artifact is present in data/<Area>
+    \$0 --verify builds/Amsterdam
+EOF
+}
+
+OPTIONAL=0
+if [ "${1:-}" = --optional ]; then
+    OPTIONAL=1
+    shift
+fi
+
+COMMAND="${1:-}"
+CONFIG_DIR="${2:-}"
+if [ -z "$COMMAND" ] || [ -z "$CONFIG_DIR" ]; then
+    usage
+    exit 1
+fi
+
+if [ ! -d "$CONFIG_DIR" ]; then
+    echo "Error: config dir \"$CONFIG_DIR\" doesn't exist" >&2
+    exit 1
+fi
+
+source bin/_source-env.sh "$CONFIG_DIR"
+
+set -o nounset
+
+MANIFEST="${CONFIG_DIR}/artifacts.json"
+
+if ! command -v jq > /dev/null; then
+    echo "Error: jq is required to read ${MANIFEST}" >&2
+    exit 1
+fi
+
+case "$COMMAND" in
+    --pin)
+        # Generate artifacts.json from what's in data/<Area>, pinning the newest of each dated artifact.
+        AREA_DIR="data/${HEADWAY_AREA}"
+        TRANSIT_DIR="${AREA_DIR}/transit"
+        MANIFEST="${CONFIG_DIR}/artifacts.json"
+
+        if [ ! -d "$AREA_DIR" ]; then
+            echo "Error: nothing built at ${AREA_DIR}" >&2
+            exit 1
+        fi
+
+        manifest="{}"
+
+        # Artifacts are named <stem>-<date>-<hash>.<ext>, so a rebuild lands
+        # beside what it replaced rather than overwriting it. Pin the newest,
+        # breaking same-day ties by which was exported last.
+        VERSION_RE='([0-9]{4}-[0-9]{2}-[0-9]{2})-[0-9a-f]+'
+
+        # Prints the newest match of <dir>/<prefix>-<version><suffix>, if any.
+        function latest_match() {
+            local dir="$1" prefix="$2" suffix="$3"
+            local path file version newest="" newest_date=""
+
+            for path in "${dir}/${prefix}-"*"${suffix}"; do
+                [ -f "$path" ] || continue
+                file=$(basename "$path")
+
+                version=${file#"${prefix}-"}
+                version=${version%"$suffix"}
+                if [[ ! $version =~ ^${VERSION_RE}$ ]]; then
+                    echo "Error: unexpected ${prefix} artifact name: ${file}" >&2
+                    exit 1
+                fi
+
+                if [[ "${BASH_REMATCH[1]}" > "$newest_date" ]] ||
+                    { [ "${BASH_REMATCH[1]}" = "$newest_date" ] && [ "$path" -nt "${dir}/${newest}" ]; }; then
+                    newest_date="${BASH_REMATCH[1]}"
+                    newest="$file"
+                fi
+            done
+            echo "$newest"
+        }
+
+        function add_latest() {
+            local key="$1" prefix="$2" suffix="$3" file
+            file=$(latest_match "$AREA_DIR" "$prefix" "$suffix")
+            [ -n "$file" ] || return 0
+            manifest=$(jq --arg key "$key" --arg file "$file" '.[$key] = $file' <<< "$manifest")
+        }
+
+        add_latest valhalla      "${HEADWAY_AREA}-valhalla"      .tar.zst
+        add_latest elasticsearch "${HEADWAY_AREA}-elasticsearch" .erofs.zst
+        add_latest placeholder   "${HEADWAY_AREA}-placeholder"   .tar.zst
+        add_latest pelias-config "${HEADWAY_AREA}-pelias"        .json
+        add_latest pmtiles       "${HEADWAY_AREA}"               .pmtiles
+        add_latest osm           "${HEADWAY_AREA}"               .osm.pbf
+
+        shared="{}"
+        for name in terrain landcover; do
+            file=$(latest_match "$AREA_DIR" "$name" .mbtiles)
+            [ -n "$file" ] || continue
+            shared=$(jq --arg key "$name" --arg file "$file" '.[$key] = $file' <<< "$shared")
+        done
+        if [ "$shared" != "{}" ]; then
+            manifest=$(jq --argjson shared "$shared" '.shared = $shared' <<< "$manifest")
+        fi
+
+        # Like add_latest, but the stem carries a zone name:
+        #   Seattle-puget-sound-graph-2026-08-14-2f1c9ab7.obj.zst
+        function add_by_zone() {
+            local key="$1" kind="$2" suffix="$3"
+            local found="{}" path file zone zones=() seen
+
+            for path in "${TRANSIT_DIR}/${HEADWAY_AREA}-"*"-${kind}-"*"$suffix"; do
+                [ -f "$path" ] || continue
+                file=$(basename "$path")
+
+                if [[ ! $file =~ ^${HEADWAY_AREA}-(.+)-${kind}-${VERSION_RE}${suffix//./\\.}$ ]]; then
+                    echo "Error: unexpected ${kind} artifact name: ${file}" >&2
+                    exit 1
+                fi
+                zone="${BASH_REMATCH[1]}"
+
+                seen=0
+                for z in "${zones[@]+"${zones[@]}"}"; do
+                    [ "$z" = "$zone" ] && seen=1
+                done
+                [ "$seen" -eq 1 ] && continue
+                zones+=("$zone")
+
+                file=$(latest_match "$TRANSIT_DIR" "${HEADWAY_AREA}-${zone}-${kind}" "$suffix")
+                found=$(jq --arg zone "$zone" --arg file "transit/$file" '.[$zone] = $file' <<< "$found")
+            done
+
+            if [ "$found" != "{}" ]; then
+                manifest=$(jq --arg key "$key" --argjson found "$found" '.[$key] = $found' <<< "$manifest")
+            fi
+        }
+
+        add_by_zone otp-graphs graph .obj.zst
+        add_by_zone gtfs gtfs .tar.zst
+
+        jq -S . <<< "$manifest" > "$MANIFEST"
+
+        echo "Wrote ${MANIFEST}:" >&2
+        cat "$MANIFEST" >&2
+        ;;
+    --verify)
+        # Ensure all pinned assets are present locally
+        AREA_DIR="data/${HEADWAY_AREA}"
+
+        if [ ! -f "$MANIFEST" ]; then
+            echo "Error: no ${MANIFEST}; run bin/build ${CONFIG_DIR}" >&2
+            exit 1
+        fi
+
+        missing=()
+        while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "${AREA_DIR}/${file}" ] || missing+=("$file")
+        done < <(jq -r '.. | strings' "$MANIFEST")
+
+        if [ ${#missing[@]} -gt 0 ]; then
+            {
+                echo "Error: ${MANIFEST} pins ${#missing[@]} artifact(s) missing from ${AREA_DIR}:"
+                printf '  %s\n' "${missing[@]}"
+                echo
+                echo "The pinned names are stale, or the build didn't finish. Either rebuild"
+                echo "(bin/build ${CONFIG_DIR}), or re-pin what's already built"
+                echo "(bin/artifacts --pin ${CONFIG_DIR})."
+            } >&2
+            exit 1
+        fi
+
+        echo "All artifacts pinned by ${MANIFEST} are present in ${AREA_DIR}."
+        ;;
+    otp-zones)
+        # The zones this build has, one per line.
+        [ -f "$MANIFEST" ] || exit 0
+        jq -r '."otp-graphs" // {} | to_entries[] | .key' "$MANIFEST"
+        ;;
+    otp-graphs)
+        # Their graphs, one per line, in the same order as otp-zones
+        [ -f "$MANIFEST" ] || exit 0
+        jq -r '."otp-graphs" // {} | to_entries[] | .value' "$MANIFEST"
+        ;;
+    pmtiles|valhalla|elasticsearch|placeholder|pelias-config|osm|terrain|landcover)
+        path=""
+        if [ -f "$MANIFEST" ]; then
+            case "$COMMAND" in
+                terrain|landcover) query='.shared[$key]? // empty' ;;
+                *) query='.[$key] // empty' ;;
+            esac
+            path=$(jq -r --arg key "$COMMAND" "$query" "$MANIFEST")
+        fi
+        if [ -z "$path" ]; then
+            [ "$OPTIONAL" -eq 1 ] && exit 0
+            echo "Error: missing ${COMMAND} in ${MANIFEST}; run bin/artifacts --pin ${CONFIG_DIR} on the build machine" >&2
+            exit 1
+        fi
+        if [ "$COMMAND" = elasticsearch ] && [[ "$path" != *.erofs.zst ]]; then
+            echo "Error: ${path} isn't an EROFS index image; rebuild with bin/build ${CONFIG_DIR}" >&2
+            exit 1
+        fi
+        printf '%s\n' "$path"
+        ;;
+    files)
+        # All artifacts for the deployment except `shared`,
+        # which is excluded because those publish to a different prefix.
+        [ -f "$MANIFEST" ] || exit 0
+        jq -r 'del(.shared) | .. | strings' "$MANIFEST"
+        ;;
+    shared-files)
+        [ -f "$MANIFEST" ] || exit 0
+        jq -r '.shared // {} | .[]' "$MANIFEST"
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

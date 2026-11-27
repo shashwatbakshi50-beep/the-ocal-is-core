@@ -1,0 +1,15 @@
+.tmp_*
+*.swp
+*.osm.pbf
+*.mbtiles
+target/
+**/.DS_Store
+data/*
+.env
+**/node_modules/*
+.bin-env
+gtfs-secrets.json
+.worktrees
+
+# Scratch space for running services outside compose (bin/ never writes here)
+local-dev/

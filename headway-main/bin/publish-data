@@ -1,0 +1,133 @@
+#!/bin/bash -e
+
+function usage() {
+  cat << EOF
+Copy deployment artifacts to asset host
+usage: $0 <build-dir> [ --host remote.host.com ]
+examples:
+    # Copy to asset root on this host
+    $0 builds/planet
+    # Copy to asset root on remote host
+    $0 builds/planet --host data.maps.internal
+
+Use an upload prefix other than what's in bin/_headway_version.sh
+    HEADWAY_DATA_TAG=dev $0 builds/Seattle
+    HEADWAY_DATA_TAG=dev $0 builds/Seattle --host data.maps.internal
+EOF
+}
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
+  usage
+  exit 1
+fi
+CONFIG_DIR=$1
+
+HOST=""
+if [ "$#" -eq 3 ]; then
+    if [ "$2" != "--host" ]; then
+        usage
+        exit 1
+    fi
+    HOST=$3
+fi
+
+source bin/_panes.sh
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+DATA_ROOT="${REPO_ROOT}/data"
+
+OUTPUT_DIR="/srv/www/data.maps.earth"
+MAX_CONCURRENT_UPLOADS=4
+
+# Run a command locally, or on $HOST if one was given.
+function run() {
+  if [ -z "$HOST" ]; then
+    "$@"
+  else
+    ssh "$HOST" "$@"
+  fi
+}
+
+# Verify one pinned artifact and emit its "<input_path>\0<output_path>\0" pair.
+function plan_upload() {
+  local file=$1
+  local output_prefix=$2
+
+  local input_path="${DATA_ROOT}/${HEADWAY_AREA}/${file}"
+  if [ ! -f "$input_path" ]; then
+    echo "pinned in ${MANIFEST} but not built here: ${file}" >&2
+    exit 1
+  fi
+
+  # The asset host mirrors data/<Area>, so a manifest value is the path here,
+  # under /bootstrap in compose, and in the URLs bin/k8s/deploy deploys.
+  printf '%s\0%s\0' "$input_path" "${OUTPUT_DIR}/${output_prefix}/${file}"
+}
+
+# rsync, so re-runs skip anything already copied.
+function upload() {
+  local input_path=$1
+  local output_path=$2
+
+  local destination="${output_path}"
+  if [ -n "$HOST" ]; then
+    destination="${HOST}:${output_path}"
+  fi
+
+  echo "${input_path} -> ${destination}"
+  rsync -a --partial --progress "$input_path" "$destination"
+}
+
+source bin/_source-env.sh "$CONFIG_DIR"
+
+if [ -z "$HEADWAY_DATA_TAG" ]; then
+    source "${REPO_ROOT}/bin/_headway_version.sh"
+fi
+export HEADWAY_DATA_TAG
+
+set -o nounset
+
+MANIFEST="${CONFIG_DIR}/artifacts.json"
+if [ ! -f "$MANIFEST" ]; then
+  echo "No pinned manifest at ${MANIFEST}"
+  echo "Run bin/artifacts --pin ${CONFIG_DIR}"
+  exit 1
+fi
+
+PLAN=$(mktemp)
+trap 'rm -f "$PLAN"; panes_cleanup' EXIT
+
+for file in $("${REPO_ROOT}/bin/artifacts" files "$CONFIG_DIR"); do
+  plan_upload "$file" "${HEADWAY_DATA_TAG}/${HEADWAY_AREA_TAG}" >> "$PLAN"
+done
+
+# Generic across all areas, so they sit above the area directory.
+for file in $("${REPO_ROOT}/bin/artifacts" shared-files "$CONFIG_DIR"); do
+  plan_upload "$file" "${HEADWAY_DATA_TAG}" >> "$PLAN"
+done
+
+# One round trip for all of them, rather than racing mkdir from each upload.
+DIRS=()
+while IFS= read -r dir; do
+  DIRS+=("$dir")
+done < <(
+  while IFS= read -r -d '' input_path && IFS= read -r -d '' output_path; do
+    dirname "$output_path"
+  done < "$PLAN" | sort -u
+)
+if [ ${#DIRS[@]} -gt 0 ]; then
+  run mkdir -p "${DIRS[@]}"
+fi
+
+panes_init "$MAX_CONCURRENT_UPLOADS"
+while IFS= read -r -d '' input_path && IFS= read -r -d '' output_path; do
+  panes_add "$(basename "$output_path")" upload "$input_path" "$output_path"
+done < "$PLAN"
+
+panes_run || {
+  panes_dump_failures
+  exit 1
+}
+
+echo "Publishing complete."
+echo "Next, deploy with bin/k8s/deploy ${CONFIG_DIR}"

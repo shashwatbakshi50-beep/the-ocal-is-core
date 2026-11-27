@@ -1,0 +1,211 @@
+package processors
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+
+	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/getlago/lago/events-processor/cache"
+	"github.com/getlago/lago/events-processor/config/database"
+	"github.com/getlago/lago/events-processor/config/kafka"
+	"github.com/getlago/lago/events-processor/config/redis"
+	"github.com/getlago/lago/events-processor/config/tracing"
+	"github.com/getlago/lago/events-processor/models"
+	"github.com/getlago/lago/events-processor/processors/events_processor"
+	"github.com/getlago/lago/events-processor/utils"
+)
+
+var (
+	processor   *events_processor.EventProcessor
+	apiStore    *models.ApiStore
+	kafkaConfig kafka.ServerConfig
+)
+
+const (
+	envEnv                                         = "ENV"
+	envLagoEventsProcessorDatabaseMaxConnections   = "LAGO_EVENTS_PROCESSOR_DATABASE_MAX_CONNECTIONS"
+	envLagoKafkaBootstrapServers                   = "LAGO_KAFKA_BOOTSTRAP_SERVERS"
+	envLagoKafkaConsumerGroup                      = "LAGO_KAFKA_CONSUMER_GROUP"
+	envLagoKafkaEnrichedEventsTopic                = "LAGO_KAFKA_ENRICHED_EVENTS_TOPIC"
+	envLagoKafkaEventsChargedInAdvanceTopic        = "LAGO_KAFKA_EVENTS_CHARGED_IN_ADVANCE_TOPIC"
+	envLagoKafkaEventsDeadLetterTopic              = "LAGO_KAFKA_EVENTS_DEAD_LETTER_TOPIC"
+	envLagoKafkaPassword                           = "LAGO_KAFKA_PASSWORD"
+	envLagoKafkaProductEnrichedEventsTopic         = "LAGO_KAFKA_PRODUCT_ENRICHED_EVENTS_TOPIC"
+	envLagoKafkaProductEventsChargedInAdvanceTopic = "LAGO_KAFKA_PRODUCT_EVENTS_CHARGED_IN_ADVANCE_TOPIC"
+	envLagoKafkaProductEventsDeadLetterTopic       = "LAGO_KAFKA_PRODUCT_EVENTS_DEAD_LETTER_TOPIC"
+	envLagoKafkaProductRawEventsTopic              = "LAGO_KAFKA_PRODUCT_RAW_EVENTS_TOPIC"
+	envLagoKafkaRawEventsTopic                     = "LAGO_KAFKA_RAW_EVENTS_TOPIC"
+	envLagoKafkaScramAlgorithm                     = "LAGO_KAFKA_SCRAM_ALGORITHM"
+	envLagoKafkaTLS                                = "LAGO_KAFKA_TLS"
+	envLagoKafkaUsageAttributionValuesTopic        = "LAGO_KAFKA_USAGE_ATTRIBUTION_VALUES_TOPIC"
+	envLagoKafkaUsername                           = "LAGO_KAFKA_USERNAME"
+	envLagoRedisCacheDB                            = "LAGO_REDIS_CACHE_DB"
+	envLagoRedisCachePassword                      = "LAGO_REDIS_CACHE_PASSWORD"
+	envLagoRedisCacheURL                           = "LAGO_REDIS_CACHE_URL"
+	envLagoRedisCacheTLS                           = "LAGO_REDIS_CACHE_TLS"
+	envLagoRedisStoreDB                            = "LAGO_REDIS_STORE_DB"
+	envLagoRedisStorePassword                      = "LAGO_REDIS_STORE_PASSWORD"
+	envLagoRedisStoreURL                           = "LAGO_REDIS_STORE_URL"
+	envLagoRedisStoreTLS                           = "LAGO_REDIS_STORE_TLS"
+)
+
+type Config struct {
+	TracerProvider tracing.TracerProvider
+	Cache          *cache.Cache
+}
+
+func initProducer(ctx context.Context, topicEnv string) (*kafka.Producer, error) {
+	if os.Getenv(topicEnv) == "" {
+		return nil, fmt.Errorf("%s variable is required", topicEnv)
+	}
+
+	topic := os.Getenv(topicEnv)
+	producer, err := kafka.NewProducer(
+		kafkaConfig,
+		&kafka.ProducerConfig{
+			Topic: topic,
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	err = producer.Ping(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return producer, nil
+}
+
+func initFlagStore(ctx context.Context, name string) (*models.FlagStore, error) {
+	redisDb, err := utils.GetEnvAsInt(envLagoRedisStoreDB, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Deprecated: Use env LAGO_REDIS_STORE_TLS instead
+	legacyTLS := os.Getenv(envEnv) == "production"
+
+	redisConfig := redis.RedisConfig{
+		Address:  os.Getenv(envLagoRedisStoreURL),
+		Password: os.Getenv(envLagoRedisStorePassword),
+		DB:       redisDb,
+		UseTLS:   utils.GetEnvAsBool(envLagoRedisStoreTLS, legacyTLS),
+	}
+
+	db, err := redis.NewRedisDB(ctx, redisConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return models.NewFlagStore(db, name), nil
+}
+
+func initKafkaConfig(tracerProvider tracing.TracerProvider) {
+	serverBrokers := utils.ParseBrokersEnv(os.Getenv(envLagoKafkaBootstrapServers))
+	if len(serverBrokers) == 0 {
+		slog.Error("brokers not found")
+		panic("brokers not found")
+	}
+
+	kafkaConfig = kafka.ServerConfig{
+		ScramAlgorithm: os.Getenv(envLagoKafkaScramAlgorithm),
+		TLS:            utils.GetEnvAsBool(envLagoKafkaTLS, false),
+		Servers:        serverBrokers,
+		TracerProvider: tracerProvider,
+		UserName:       os.Getenv(envLagoKafkaUsername),
+		Password:       os.Getenv(envLagoKafkaPassword),
+	}
+}
+
+// initApiStore connects to the database when the processor reads from it
+// instead of the in-memory cache.
+func initApiStore() (*models.ApiStore, func()) {
+	maxConns, err := utils.GetEnvAsInt(envLagoEventsProcessorDatabaseMaxConnections, 200)
+	if err != nil {
+		utils.LogAndPanic(err, "Error converting max connections into integer")
+	}
+
+	dbConfig := database.DBConfig{
+		Url:      os.Getenv("DATABASE_URL"),
+		MaxConns: int32(maxConns),
+	}
+
+	db, err := database.NewConnection(dbConfig)
+	if err != nil {
+		utils.LogAndPanic(err, "Error connecting to the database")
+	}
+
+	return models.NewApiStore(db), db.Close
+}
+
+func StartProcessingEvents(ctx context.Context, config *Config) {
+	initKafkaConfig(config.TracerProvider)
+
+	eventsEnrichedProducer, err := initProducer(ctx, envLagoKafkaEnrichedEventsTopic)
+	if err != nil {
+		utils.LogAndPanic(err, "failed to initialize enriched events producer")
+	}
+
+	eventsInAdvanceProducer, err := initProducer(ctx, envLagoKafkaEventsChargedInAdvanceTopic)
+	if err != nil {
+		utils.LogAndPanic(err, "failed to initialize events charged in advance producer")
+	}
+
+	eventsDeadLetterQueue, err := initProducer(ctx, envLagoKafkaEventsDeadLetterTopic)
+	if err != nil {
+		utils.LogAndPanic(err, "failed to initialize events dead letter queue producer")
+	}
+
+	// Optional: without the topic, account tree values are not reported.
+	var attributionValuesProducer kafka.MessageProducer
+	if os.Getenv(envLagoKafkaUsageAttributionValuesTopic) != "" {
+		attributionValuesProducer, err = initProducer(ctx, envLagoKafkaUsageAttributionValuesTopic)
+		if err != nil {
+			utils.LogAndPanic(err, "failed to initialize usage attribution values producer")
+		}
+	}
+
+	if config.Cache == nil {
+		var closeDB func()
+		apiStore, closeDB = initApiStore()
+		defer closeDB()
+	}
+
+	flagger, err := initFlagStore(ctx, "subscription_refreshed_v2")
+	if err != nil {
+		utils.LogAndPanic(err, "Error connecting to the flag store")
+	}
+	defer flagger.Close()
+
+	processor = events_processor.NewEventProcessor(
+		events_processor.NewEventEnrichmentService(apiStore, config.Cache),
+		events_processor.NewEventProducerService(
+			eventsEnrichedProducer,
+			eventsInAdvanceProducer,
+			eventsDeadLetterQueue,
+		),
+		events_processor.NewSubscriptionRefreshService(flagger),
+		events_processor.NewAttributionValuesService(attributionValuesProducer),
+	)
+
+	cg, err := kafka.NewConsumerGroup(
+		kafkaConfig,
+		&kafka.ConsumerGroupConfig{
+			Topic:         os.Getenv(envLagoKafkaRawEventsTopic),
+			ConsumerGroup: os.Getenv(envLagoKafkaConsumerGroup),
+			ProcessRecords: func(ctx context.Context, records []*kgo.Record) []*kgo.Record {
+				return processor.ProcessEvents(ctx, records)
+			},
+		})
+	if err != nil {
+		utils.LogAndPanic(err, "Error starting the event consumer")
+	}
+
+	slog.Info("Starting event consumer")
+	cg.Start(ctx)
+	slog.Info("Event processor stopped")
+}

@@ -1,0 +1,122 @@
+#!/bin/bash
+
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/_pvc-lib.sh"
+
+function usage() {
+cat << EOF
+usage: $0 <namespace> [--delete]
+
+Lists the headway PersistentVolumeClaims that nothing references anymore - the
+volumes left behind after a planet version bump or a transit rebuild moved the
+deployments onto freshly-named claims.
+
+A PVC is kept if any Deployment/StatefulSet pod template names it, or if any pod
+that currently exists mounts it. Everything else is unused.
+
+Only lists them unless you pass --delete.
+
+Examples:
+    $0 planet                 # show what would be deleted
+    $0 planet --delete        # actually delete it
+    $0 seattle --delete
+EOF
+}
+
+DELETE=0
+NAMESPACE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --delete) DELETE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            if [ -z "$NAMESPACE" ]; then
+                NAMESPACE="$1"
+            else
+                echo "Unknown argument: $1" >&2
+                usage >&2
+                exit 1
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$NAMESPACE" ]; then
+    usage >&2
+    exit 1
+fi
+
+pvc_lib_set_namespace "$NAMESPACE"
+
+pvc_lib_require_deps
+
+in_use=$(in_use_claims)
+
+orphaned=()
+while IFS=$'\t' read -r name capacity phase created; do
+    [ -n "$name" ] || continue
+    if ! grep -qxF "$name" <<< "$in_use"; then
+        orphaned+=("$name")
+        printf '  %-12s %-10s %-24s %s\n' "$capacity" "$phase" "$created" "$name"
+    fi
+done < <(headway_pvcs)
+
+if [ "${#orphaned[@]}" -eq 0 ]; then
+    echo "Nothing unused - every headway PVC is still referenced."
+    exit 0
+fi
+
+echo ""
+if [ "$DELETE" -ne 1 ]; then
+    echo "${#orphaned[@]} PVC(s) above are unreferenced. Re-run with --delete to delete them."
+    exit 0
+fi
+
+for pvc in "${orphaned[@]}"; do
+    echo "Deleting ${pvc}..."
+    "${KUBECTL[@]}" delete pvc "$pvc"
+done
+
+# The provisioner deletes a `Delete`-policy PV asynchronously, so it's briefly
+# `Released` after its claim goes away. Give it time before calling it stuck.
+function released_pvs() {
+    "${KUBECTL[@]}" get pv -o json \
+        | jq -r --arg ns "$NAMESPACE" --arg policy "$1" '.items[]
+            | select(.status.phase == "Released"
+                and .spec.claimRef.namespace == $ns
+                and .spec.persistentVolumeReclaimPolicy == $policy)
+            | "pv/" + .metadata.name'
+}
+
+reclaiming=$(released_pvs Delete)
+if [ -n "$reclaiming" ]; then
+    echo ""
+    echo "Waiting for the provisioner to reclaim released volumes..."
+    # shellcheck disable=SC2086
+    "${KUBECTL[@]}" wait --for=delete --timeout=120s $reclaiming 2>&1 | sed 's/^/  /' || true
+fi
+
+stuck=$(released_pvs Delete)
+retained=$(released_pvs Retain)
+
+if [ -n "$stuck" ]; then
+    echo ""
+    echo "WARNING: these PersistentVolumes have reclaim policy Delete but the"
+    echo "provisioner hasn't removed them; check its logs:"
+    sed 's/^/  /' <<< "$stuck"
+fi
+
+if [ -n "$retained" ]; then
+    echo ""
+    echo "WARNING: these PersistentVolumes have reclaim policy Retain, so their disk"
+    echo "is not reclaimed:"
+    sed 's/^/  /' <<< "$retained"
+    echo "Delete them with: kubectl delete <name>"
+fi
+
+if [ -z "$stuck" ] && [ -z "$retained" ]; then
+    echo ""
+    echo "✅ All unused PVCs successfully deleted."
+fi

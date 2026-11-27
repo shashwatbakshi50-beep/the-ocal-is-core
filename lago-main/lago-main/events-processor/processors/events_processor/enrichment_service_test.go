@@ -1,0 +1,527 @@
+package events_processor
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/getlago/lago/events-processor/cache"
+	"github.com/getlago/lago/events-processor/models"
+	"github.com/getlago/lago/events-processor/tests"
+	"github.com/getlago/lago/events-processor/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type enrichmentTestEnv struct {
+	EventProcessor *EventEnrichmentService
+	DataStore      DataStore
+	Cleanup        func()
+}
+
+func setupEnrichmentTestEnv(t *testing.T, useCache bool) *enrichmentTestEnv {
+	var memCache *cache.Cache
+	var apiStore *models.ApiStore
+	var dataStore DataStore
+	var cleanup func()
+
+	if useCache {
+		ctx := context.Background()
+		memCache, _ = cache.NewCache(cache.CacheConfig{
+			Context: ctx,
+		})
+		dataStore = &CacheDataStore{cache: memCache, t: t}
+		cleanup = func() { memCache.Close() }
+	} else {
+		mockedStore, deleteFunc := tests.SetupMockStore(t)
+		apiStore = models.NewApiStore(mockedStore.DB)
+		dataStore = &MockDataStore{mock: mockedStore, t: t}
+		cleanup = deleteFunc
+	}
+
+	processor := &EventEnrichmentService{
+		apiStore: apiStore,
+		memCache: memCache,
+	}
+
+	return &enrichmentTestEnv{
+		EventProcessor: processor,
+		DataStore:      dataStore,
+		Cleanup:        cleanup,
+	}
+}
+
+func TestEnrichEvent(t *testing.T) {
+	testModes := []struct {
+		name     string
+		useCache bool
+	}{
+		{"WithCache", true},
+		{"WithoutCache", false},
+	}
+
+	for _, mode := range testModes {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Run("Without Billable Metric", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				event := models.Event{
+					OrganizationID:         "1a901a90-1a90-1a90-1a90-1a901a901a90",
+					ExternalSubscriptionID: "sub_id",
+					Code:                   "api_calls",
+					Timestamp:              1741007009,
+				}
+
+				testEnv.DataStore.ExpectBillableMetricNotFound()
+				result := testEnv.EventProcessor.EnrichEvent(&event)
+				assert.False(t, result.Success())
+				if mode.useCache {
+					assert.Equal(t, "Key not found", result.ErrorMsg())
+				} else {
+					assert.Equal(t, "record not found", result.ErrorMsg())
+				}
+				assert.Equal(t, "fetch_billable_metric", result.ErrorCode())
+				assert.Equal(t, "Error fetching billable metric", result.ErrorMessage())
+			})
+
+			t.Run("When timestamp is invalid", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				event := models.Event{
+					OrganizationID:         "1a901a90-1a90-1a90-1a90-1a901a901a90",
+					ExternalSubscriptionID: "sub_id",
+					Code:                   "api_calls",
+					Timestamp:              "2025-03-06 12:00:00",
+					Source:                 "SQS",
+				}
+
+				bm := &models.BillableMetric{
+					ID:              "bm123",
+					OrganizationID:  event.OrganizationID,
+					Code:            event.Code,
+					AggregationType: models.AggregationTypeWeightedSum,
+					FieldName:       "api_requests",
+					Expression:      "",
+					CreatedAt:       utils.NowNullTime(),
+					UpdatedAt:       utils.NowNullTime(),
+				}
+				testEnv.DataStore.SetBillableMetric(bm)
+
+				enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+				assert.False(t, enrichResult.Success())
+				assert.Contains(t, enrichResult.ErrorMsg(), "unsupported timestamp \"2025-03-06 12:00:00\": not a Unix timestamp")
+				assert.Contains(t, enrichResult.ErrorMsg(), "or RFC3339")
+				assert.Equal(t, "build_enriched_event", enrichResult.ErrorCode())
+				assert.Equal(t, "Error while converting event to enriched event", enrichResult.ErrorMessage())
+			})
+
+			t.Run("When expression failed to evaluate", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				event := models.Event{
+					OrganizationID:         "1a901a90-1a90-1a90-1a90-1a901a901a90",
+					ExternalSubscriptionID: "sub_id",
+					Code:                   "api_calls",
+					Timestamp:              "1741007009.123",
+					Source:                 "SQS",
+				}
+
+				bm := &models.BillableMetric{
+					ID:              "bm123",
+					OrganizationID:  event.OrganizationID,
+					Code:            event.Code,
+					AggregationType: models.AggregationTypeWeightedSum,
+					FieldName:       "api_requests",
+					Expression:      "round(event.properties.value)",
+					CreatedAt:       utils.NowNullTime(),
+					UpdatedAt:       utils.NowNullTime(),
+				}
+				testEnv.DataStore.SetBillableMetric(bm)
+
+				enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+				assert.False(t, enrichResult.Success())
+				assert.Contains(t, enrichResult.ErrorMsg(), "failed to evaluate expr: round(event.properties.value)")
+				assert.Equal(t, "evaluate_expression", enrichResult.ErrorCode())
+				assert.Equal(t, "Error evaluating custom expression", enrichResult.ErrorMessage())
+			})
+
+			t.Run("With a recurring billable metric and no subscription active at the event timestamp", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				orgID := "1a901a90-1a90-1a90-1a90-1a901a901a90"
+
+				// Event dated 2025-03-03
+				event := models.Event{
+					OrganizationID:         orgID,
+					ExternalSubscriptionID: "sub_id",
+					Code:                   "api_calls",
+					Timestamp:              1741007009.0,
+					Source:                 "SQS",
+				}
+
+				bm := &models.BillableMetric{
+					ID:              "bm123",
+					OrganizationID:  event.OrganizationID,
+					Code:            event.Code,
+					AggregationType: models.AggregationTypeCount,
+					Recurring:       true,
+					CreatedAt:       utils.NowNullTime(),
+					UpdatedAt:       utils.NowNullTime(),
+				}
+				testEnv.DataStore.SetBillableMetric(bm)
+
+				// Subscription started after the event timestamp but is currently active,
+				// so it is only found when falling back on time.Now().
+				sub := &models.Subscription{
+					ID:             "sub123",
+					OrganizationID: &event.OrganizationID,
+					ExternalID:     event.ExternalSubscriptionID,
+					PlanID:         "plan_id",
+					StartedAt:      utils.NewNullTime(time.Unix(1751000000, 0)),
+				}
+				// First lookup (event timestamp) misses, fallback lookup (now) hits.
+				testEnv.DataStore.ExpectSubscriptionNotFound()
+				testEnv.DataStore.SetSubscription(sub)
+
+				enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+				assert.True(t, enrichResult.Success())
+
+				eventResult := enrichResult.Value()
+				assert.NotNil(t, eventResult.Subscription)
+				assert.Equal(t, "sub123", eventResult.SubscriptionID)
+				assert.Equal(t, "plan_id", eventResult.PlanID)
+			})
+
+			t.Run("With a non-recurring billable metric and no subscription active at the event timestamp", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				orgID := "1a901a90-1a90-1a90-1a90-1a901a901a90"
+
+				event := models.Event{
+					OrganizationID:         orgID,
+					ExternalSubscriptionID: "sub_id",
+					Code:                   "api_calls",
+					Timestamp:              1741007009.0,
+					Source:                 "SQS",
+				}
+
+				bm := &models.BillableMetric{
+					ID:              "bm123",
+					OrganizationID:  event.OrganizationID,
+					Code:            event.Code,
+					AggregationType: models.AggregationTypeCount,
+					Recurring:       false,
+					CreatedAt:       utils.NowNullTime(),
+					UpdatedAt:       utils.NowNullTime(),
+				}
+				testEnv.DataStore.SetBillableMetric(bm)
+
+				// A currently active subscription exists but started after the event
+				// timestamp. Since the metric is not recurring, no fallback happens and
+				// the event is enriched without a subscription (a single lookup, at the
+				// event timestamp, that misses).
+				if mode.useCache {
+					// In cache mode the timestamp filtering excludes the subscription
+					// because it started after the event timestamp.
+					sub := &models.Subscription{
+						ID:             "sub123",
+						OrganizationID: &event.OrganizationID,
+						ExternalID:     event.ExternalSubscriptionID,
+						PlanID:         "plan_id",
+						StartedAt:      utils.NewNullTime(time.Unix(1751000000, 0)),
+					}
+					testEnv.DataStore.SetSubscription(sub)
+				} else {
+					testEnv.DataStore.ExpectSubscriptionNotFound()
+				}
+
+				enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+				assert.True(t, enrichResult.Success())
+
+				eventResult := enrichResult.Value()
+				assert.Nil(t, eventResult.Subscription)
+				assert.Equal(t, "", eventResult.SubscriptionID)
+			})
+
+			t.Run("With usage attribution types", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				orgID := "1a901a90-1a90-1a90-1a90-1a901a901a90"
+
+				event := models.Event{
+					OrganizationID:         orgID,
+					ExternalSubscriptionID: "sub_id",
+					Code:                   "tokens",
+					Timestamp:              1741007009.0,
+					Source:                 "SQS",
+					Properties: map[string]any{
+						"tokens":        "1000",
+						"department_id": "rnd",
+						"userId":        "alice",
+						"model":         "opus",
+					},
+				}
+
+				bm := &models.BillableMetric{
+					ID:                       "bm123",
+					OrganizationID:           orgID,
+					Code:                     event.Code,
+					AggregationType:          models.AggregationTypeSum,
+					FieldName:                "tokens",
+					HasUsageAttributionTypes: true,
+					CreatedAt:                utils.NowNullTime(),
+					UpdatedAt:                utils.NowNullTime(),
+				}
+				testEnv.DataStore.SetBillableMetric(bm)
+
+				sub := &models.Subscription{
+					ID:             "sub123",
+					OrganizationID: &orgID,
+					ExternalID:     event.ExternalSubscriptionID,
+					PlanID:         "plan_id",
+					StartedAt:      utils.NewNullTime(time.Unix(1700000000, 0)),
+				}
+				testEnv.DataStore.SetSubscription(sub)
+
+				testEnv.DataStore.SetUsageAttributionTypes(
+					&models.UsageAttributionType{Code: "department", AttributionKeys: utils.StringArray{"department_id"}},
+					&models.UsageAttributionType{Code: "user", AttributionKeys: utils.StringArray{"user_id", "userId"}},
+					&models.UsageAttributionType{Code: "model", AttributionKeys: utils.StringArray{"model"}},
+					&models.UsageAttributionType{Code: "region", AttributionKeys: utils.StringArray{"region"}},
+				)
+
+				enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+				require.True(t, enrichResult.Success())
+
+				if mode.useCache {
+					assert.Nil(t, enrichResult.Value().AttributionLabels)
+				} else {
+					assert.Equal(
+						t,
+						map[string]string{"department": "rnd", "user": "alice", "model": "opus"},
+						enrichResult.Value().AttributionLabels,
+					)
+				}
+				assert.Equal(t, "1000", *enrichResult.Value().Value)
+			})
+
+			t.Run("Without usage attribution types", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				orgID := "1a901a90-1a90-1a90-1a90-1a901a901a90"
+
+				event := models.Event{
+					OrganizationID:         orgID,
+					ExternalSubscriptionID: "sub_id",
+					Code:                   "tokens",
+					Timestamp:              1741007009.0,
+					Source:                 "SQS",
+					Properties:             map[string]any{"tokens": "1000", "user_id": "alice"},
+				}
+
+				bm := &models.BillableMetric{
+					ID:              "bm123",
+					OrganizationID:  orgID,
+					Code:            event.Code,
+					AggregationType: models.AggregationTypeSum,
+					FieldName:       "tokens",
+					CreatedAt:       utils.NowNullTime(),
+					UpdatedAt:       utils.NowNullTime(),
+				}
+				testEnv.DataStore.SetBillableMetric(bm)
+				testEnv.DataStore.ExpectSubscriptionNotFound()
+
+				// Registered, but not queried: the billable metric tells the organization has none.
+				testEnv.DataStore.SetUsageAttributionTypes(
+					&models.UsageAttributionType{Code: "user", AttributionKeys: utils.StringArray{"user_id"}},
+				)
+
+				enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+				require.True(t, enrichResult.Success())
+				assert.Nil(t, enrichResult.Value().AttributionLabels)
+			})
+
+			if !mode.useCache {
+				t.Run("When usage attribution types cannot be fetched", func(t *testing.T) {
+					testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+					defer testEnv.Cleanup()
+
+					orgID := "1a901a90-1a90-1a90-1a90-1a901a901a90"
+
+					event := models.Event{
+						OrganizationID:         orgID,
+						ExternalSubscriptionID: "sub_id",
+						Code:                   "tokens",
+						Timestamp:              1741007009.0,
+						Source:                 "SQS",
+						Properties:             map[string]any{"tokens": "1000", "user_id": "alice"},
+					}
+
+					bm := &models.BillableMetric{
+						ID:                       "bm123",
+						OrganizationID:           orgID,
+						Code:                     event.Code,
+						AggregationType:          models.AggregationTypeSum,
+						FieldName:                "tokens",
+						HasUsageAttributionTypes: true,
+						CreatedAt:                utils.NowNullTime(),
+						UpdatedAt:                utils.NowNullTime(),
+					}
+					testEnv.DataStore.SetBillableMetric(bm)
+					testEnv.DataStore.ExpectSubscriptionNotFound()
+					testEnv.DataStore.ExpectUsageAttributionTypesError()
+
+					enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+
+					// Events processed with the cache do not look the types up.
+					if mode.useCache {
+						require.True(t, enrichResult.Success())
+						assert.Nil(t, enrichResult.Value().AttributionLabels)
+						return
+					}
+
+					require.True(t, enrichResult.Failure())
+					assert.True(t, enrichResult.IsRetryable())
+					assert.Equal(t, "fetch_usage_attribution_types", enrichResult.ErrorCode())
+				})
+
+				t.Run("When a custom expression overwrites an attribution key", func(t *testing.T) {
+					testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+					defer testEnv.Cleanup()
+
+					orgID := "1a901a90-1a90-1a90-1a90-1a901a901a90"
+
+					event := models.Event{
+						OrganizationID:         orgID,
+						ExternalSubscriptionID: "sub_id",
+						Code:                   "tokens",
+						Timestamp:              1741007009.0,
+						Source:                 "SQS",
+						Properties:             map[string]any{"units": 3, "user_id": "alice"},
+					}
+
+					bm := &models.BillableMetric{
+						ID:                       "bm123",
+						OrganizationID:           orgID,
+						Code:                     event.Code,
+						AggregationType:          models.AggregationTypeSum,
+						FieldName:                "user_id",
+						Expression:               "event.properties.units * 2",
+						HasUsageAttributionTypes: true,
+						CreatedAt:                utils.NowNullTime(),
+						UpdatedAt:                utils.NowNullTime(),
+					}
+					testEnv.DataStore.SetBillableMetric(bm)
+					testEnv.DataStore.ExpectSubscriptionNotFound()
+					testEnv.DataStore.SetUsageAttributionTypes(
+						&models.UsageAttributionType{Code: "user", AttributionKeys: utils.StringArray{"user_id"}},
+					)
+
+					enrichResult := testEnv.EventProcessor.EnrichEvent(&event)
+					require.True(t, enrichResult.Success())
+					assert.Equal(t, "6", *enrichResult.Value().Value)
+					assert.Equal(t, map[string]string{"user": "alice"}, enrichResult.Value().AttributionLabels)
+				})
+			}
+		})
+	}
+}
+
+func TestHasPayInAdvanceCharge(t *testing.T) {
+	testModes := []struct {
+		name     string
+		useCache bool
+	}{
+		{"WithCache", true},
+		{"WithoutCache", false},
+	}
+
+	for _, mode := range testModes {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Run("Without billable metric", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				enrichedEvent := &models.EnrichedEvent{
+					OrganizationID: "org-123",
+					PlanID:         "plan-123",
+				}
+
+				result := testEnv.EventProcessor.HasPayInAdvanceCharge(enrichedEvent)
+				assert.True(t, result.Success())
+				assert.False(t, result.Value())
+			})
+
+			t.Run("Without plan", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				enrichedEvent := &models.EnrichedEvent{
+					OrganizationID: "org-123",
+					BillableMetric: &models.BillableMetric{ID: "bm-123"},
+				}
+
+				result := testEnv.EventProcessor.HasPayInAdvanceCharge(enrichedEvent)
+				assert.True(t, result.Success())
+				assert.False(t, result.Value())
+			})
+
+			t.Run("With a charge charged in advance", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				testEnv.DataStore.SetCharge(&models.Charge{
+					ID:               "charge-123",
+					OrganizationID:   "org-123",
+					PlanID:           "plan-123",
+					BillableMetricID: "bm-123",
+					PayInAdvance:     true,
+					CreatedAt:        utils.NowNullTime(),
+					UpdatedAt:        utils.NowNullTime(),
+				})
+
+				enrichedEvent := &models.EnrichedEvent{
+					OrganizationID: "org-123",
+					PlanID:         "plan-123",
+					BillableMetric: &models.BillableMetric{ID: "bm-123"},
+				}
+
+				result := testEnv.EventProcessor.HasPayInAdvanceCharge(enrichedEvent)
+				assert.True(t, result.Success())
+				assert.True(t, result.Value())
+			})
+
+			t.Run("Without any charge charged in advance", func(t *testing.T) {
+				testEnv := setupEnrichmentTestEnv(t, mode.useCache)
+				defer testEnv.Cleanup()
+
+				testEnv.DataStore.SetCharge(&models.Charge{
+					ID:               "charge-123",
+					OrganizationID:   "org-123",
+					PlanID:           "plan-123",
+					BillableMetricID: "bm-123",
+					PayInAdvance:     false,
+					CreatedAt:        utils.NowNullTime(),
+					UpdatedAt:        utils.NowNullTime(),
+				})
+
+				enrichedEvent := &models.EnrichedEvent{
+					OrganizationID: "org-123",
+					PlanID:         "plan-123",
+					BillableMetric: &models.BillableMetric{ID: "bm-123"},
+				}
+
+				result := testEnv.EventProcessor.HasPayInAdvanceCharge(enrichedEvent)
+				assert.True(t, result.Success())
+				assert.False(t, result.Value())
+			})
+		})
+	}
+}

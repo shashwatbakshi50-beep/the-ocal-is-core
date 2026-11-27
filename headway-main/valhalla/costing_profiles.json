@@ -1,0 +1,140 @@
+{
+  "village_car": {
+    "description": "Narrow village streets and rural tracks: favours small lanes, tolerates unpaved tracks, avoids motorways.",
+    "costing": "auto",
+    "costing_options": {
+      "auto": {
+        "use_tracks": 0.45,
+        "use_living_streets": 0.6,
+        "use_highways": 0.3,
+        "use_tolls": 0.0,
+        "use_ferry": 0.2,
+        "service_penalty": 20,
+        "service_factor": 1.2,
+        "low_class_penalty": 10,
+        "low_class_factor": 1.1,
+        "maneuver_penalty": 5,
+        "exclude_unpaved": 0,
+        "height": 1.9,
+        "width": 1.8,
+        "length": 4.4,
+        "weight": 1.8,
+        "top_speed": 90
+      }
+    }
+  },
+  "rural_track": {
+    "description": "Rural tracks and farm access roads: strongly prefers tracks and service roads over main roads.",
+    "costing": "auto",
+    "costing_options": {
+      "auto": {
+        "use_tracks": 0.9,
+        "use_living_streets": 0.8,
+        "use_highways": 0.1,
+        "use_tolls": 0.0,
+        "service_penalty": 0,
+        "service_factor": 1.0,
+        "low_class_penalty": 0,
+        "low_class_factor": 1.0,
+        "maneuver_penalty": 2,
+        "exclude_unpaved": 0,
+        "height": 2.0,
+        "width": 1.9,
+        "length": 4.8,
+        "weight": 2.2,
+        "top_speed": 60
+      }
+    }
+  },
+  "village_van": {
+    "description": "Delivery van for narrow village streets: explicit vehicle dimensions so width/height/weight restrictions are respected.",
+    "costing": "auto",
+    "costing_options": {
+      "auto": {
+        "use_tracks": 0.5,
+        "use_living_streets": 0.7,
+        "use_highways": 0.25,
+        "service_penalty": 10,
+        "service_factor": 1.1,
+        "low_class_penalty": 5,
+        "low_class_factor": 1.0,
+        "exclude_unpaved": 0,
+        "height": 2.4,
+        "width": 2.0,
+        "length": 5.4,
+        "weight": 3.5,
+        "top_speed": 80
+      }
+    }
+  },
+  "truck": {
+    "description": "HGV profile with axle limits; narrow village streets are penalised rather than forbidden.",
+    "costing": "truck",
+    "costing_options": {
+      "truck": {
+        "use_tracks": 0.15,
+        "use_living_streets": 0.1,
+        "use_highways": 0.8,
+        "use_truck_route": 0.6,
+        "service_penalty": 60,
+        "service_factor": 1.5,
+        "low_class_penalty": 120,
+        "low_class_factor": 1.8,
+        "hgv_no_access_penalty": 43200,
+        "exclude_unpaved": 1,
+        "height": 4.11,
+        "width": 2.6,
+        "length": 21.64,
+        "weight": 21.77,
+        "axle_load": 9.07,
+        "axle_count": 5,
+        "hazmat": false,
+        "top_speed": 90
+      }
+    }
+  },
+  "bus": {
+    "description": "Bus profile sized for rural village services.",
+    "costing": "bus",
+    "costing_options": {
+      "bus": {
+        "use_tracks": 0.2,
+        "use_living_streets": 0.2,
+        "use_highways": 0.5,
+        "service_penalty": 30,
+        "low_class_penalty": 60,
+        "exclude_unpaved": 1,
+        "height": 3.2,
+        "width": 2.5,
+        "length": 12.0,
+        "weight": 14.0,
+        "top_speed": 80
+      }
+    }
+  },
+  "bicycle": {
+    "description": "Bicycle profile that accepts rural tracks but avoids fast roads.",
+    "costing": "bicycle",
+    "costing_options": {
+      "bicycle": {
+        "bicycle_type": "Hybrid",
+        "cycling_speed": 16,
+        "use_roads": 0.2,
+        "use_hills": 0.3,
+        "avoid_bad_surfaces": 0.4,
+        "use_ferry": 0.2
+      }
+    }
+  },
+  "pedestrian": {
+    "description": "Walking profile for village lanes, tracks and footpaths.",
+    "costing": "pedestrian",
+    "costing_options": {
+      "pedestrian": {
+        "walking_speed": 5.0,
+        "use_hills": 0.2,
+        "use_ferry": 0.1
+      }
+    }
+  }
+}

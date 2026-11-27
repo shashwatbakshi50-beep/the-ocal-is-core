@@ -1,0 +1,5 @@
+target/
+apple/
+.git/
+*.png
+*.svg

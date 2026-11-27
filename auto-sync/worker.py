@@ -735,6 +735,11 @@ def _overture_theme(
         f"WHERE {predicate}"
     ).fetchall()
     files = [str(row[0]) for row in candidates]
+    if OVERTURE_PARQUET_GLOB and "{" not in OVERTURE_PARQUET_GLOB:
+        # One glob can match several themes; keep only this theme's files.
+        scoped = [p for p in files if f"theme={theme}" in p or f"/{theme}/" in p]
+        if scoped:
+            files = scoped
     if not files:
         log.info("overture %s/%s: no files intersect bbox", theme, kind)
         return

@@ -15,8 +15,24 @@ usage() {
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-if docker compose version >/dev/null 2>&1; then
-    DC=(docker compose)
+if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is required" >&2
+    exit 1
+fi
+
+DOCKER=(docker)
+if ! docker info >/dev/null 2>&1; then
+    if sudo -n docker info >/dev/null 2>&1; then
+        DOCKER=(sudo docker)
+        echo "using sudo for docker (add your user to the docker group to avoid this)"
+    else
+        echo "cannot reach the docker daemon; start Docker or fix permissions" >&2
+        exit 1
+    fi
+fi
+
+if "${DOCKER[@]}" compose version >/dev/null 2>&1; then
+    DC=("${DOCKER[@]}" compose)
 elif command -v docker-compose >/dev/null 2>&1; then
     DC=(docker-compose)
 else

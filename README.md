@@ -74,6 +74,12 @@ H3-indexed road history in PostGIS.
 * **PMTiles** – offline extracts are cut from a planet-scale archive by
   `headway-cli` (built from `libheadway-main`), then served for download.
 
+An Overture sync reads the parquet `bbox` column of every file that intersects
+the requested area, so the first run against a small bbox still pulls a few
+hundred MB from S3 (minutes on a fast link, tens of minutes on a slow one). The
+result is cached in PostGIS: re-running the same bbox only creates versions for
+features that actually changed.
+
 ### API
 
 | Method | Path | Purpose |
@@ -128,6 +134,8 @@ All settings are environment variables (see `.env.example`). The important ones:
 | `OVERPASS_URL` / `OVERPASS_TIMEOUT` | public endpoint / `180` | Overpass endpoint and per-request timeout |
 | `OVERTURE_ENABLED` | `1` | read Overture parquet |
 | `OVERTURE_RELEASE` | latest STAC release | pin an Overture release |
+| `OVERTURE_LIMIT` | `50000` | max rows read per Overture theme per sync |
+| `UPSERT_BATCH` | `500` | features per commit while writing road history |
 | `ELEVATION_PROVIDER` | `none` | `opentopodata` or `open-elevation` when OSM `ele` tags are missing |
 | `PMTILES_SOURCE_URL` | empty | planet-scale `.pmtiles` used for extracts |
 | `VALHALLA_URL` | `http://valhalla:8002` | Valhalla endpoint for the route proxy |
@@ -174,3 +182,6 @@ There is no test suite yet. The pipeline was verified manually end to end:
 * `headway-cli extract` producing a valid clustered PMTiles archive, served by
   `headway-cli serve` and downloaded through `/api/pmtiles/{name}`.
 * Valhalla proxy injecting `exclude_polygons` and the `village_van` costing profile.
+* `docker compose` stack: postgres, auto-sync and libheadway healthy, PMTiles
+  extracted inside the `auto-sync` container through the bundled `headway-cli`,
+  closure and history endpoints answered from the compose network.
